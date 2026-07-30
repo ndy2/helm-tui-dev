@@ -1125,6 +1125,51 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, listCmd
 		} else if m.state == stateMenu {
+			if m.isEditing {
+				if msg.String() == "esc" {
+					m.isEditing = false
+					return m, nil
+				}
+				if msg.String() == "enter" {
+					p := m.selected
+					switch m.editingField {
+					case quickEditChartVer:
+						p.Version = m.editingInput.Value()
+					case quickEditAppVersion:
+						p.RemoteValues = applyAppVersion(p.RemoteValues, m.editingInput.Value())
+					}
+					releases := m.config.Contexts[m.currentContext]
+					for i, r := range releases {
+						if r.ReleaseName == m.selected.ReleaseName {
+							m.config.Contexts[m.currentContext][i] = p
+							break
+						}
+					}
+					if err := m.config.Save(); err != nil {
+						m.err = err
+					} else {
+						m.refreshLists()
+						m.selected = p
+					}
+					m.isEditing = false
+					return m, nil
+				}
+				if fieldNavDelta(msg) != 0 {
+					m.editingField = (m.editingField + 1) % 2
+					var val string
+					switch m.editingField {
+					case quickEditChartVer:
+						val = m.selected.Version
+					case quickEditAppVersion:
+						val = extractAppVersion(m.selected.RemoteValues)
+					}
+					m.editingInput.SetValue(val)
+					return m, nil
+				}
+				var editCmd tea.Cmd
+				m.editingInput, editCmd = m.editingInput.Update(msg)
+				return m, editCmd
+			}
 			if msg.String() == "up" || msg.String() == "down" {
 				cmd := m.navigateSelection(msg)
 				return m, cmd
@@ -1142,6 +1187,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if msg.String() == "e" {
+				m.isEditing = true
+				m.editingField = quickEditAppVersion
+				m.editingInput = textinput.New()
+				m.editingInput.SetValue(extractAppVersion(m.selected.RemoteValues))
+				m.editingInput.Focus()
+				return m, nil
+			}
+			if msg.String() == "E" {
 				m.setupEditProfileForm()
 				m.state = stateEditProfile
 				return m, m.inputs[m.focus].Focus()
@@ -1551,21 +1604,29 @@ func (m *Model) View() string {
 		s += "\n" + hintLine(keyHint{"tab", "switch field"}, keyHint{"enter", "save"}, keyHint{"esc", "cancel"})
 	case stateMenu:
 		s += fmt.Sprintf("Selected: %s\n\n", m.selected.ReleaseName)
-		s += hintLines(
-			keyHint{"h", "History"},
-			keyHint{"u", "Upgrade"},
-			keyHint{"i", "Install"},
-			keyHint{"r", "Rollback"},
-			keyHint{"d", "Delete"},
-			keyHint{"e", "Edit Profile"},
-			keyHint{"x", "Delete Profile"},
-		)
-		menuHints := []keyHint{{"↑↓", "switch release"}}
-		if m.activeTab == contextTab {
-			menuHints = append(menuHints, keyHint{"[ ]", "switch context"})
+		if m.isEditing {
+			s += hintStyle.Render("Editing... ") + hintLine(
+				keyHint{"tab", "switch field"},
+				keyHint{"enter", "save"},
+				keyHint{"esc", "cancel"},
+			)
+		} else {
+			s += hintLines(
+				keyHint{"h", "History"},
+				keyHint{"u", "Upgrade"},
+				keyHint{"i", "Install"},
+				keyHint{"r", "Rollback"},
+				keyHint{"d", "Delete"},
+				keyHint{"e/E", "Edit Profile"},
+				keyHint{"x", "Delete Profile"},
+			)
+			menuHints := []keyHint{{"↑↓", "switch release"}}
+			if m.activeTab == contextTab {
+				menuHints = append(menuHints, keyHint{"[ ]", "switch context"})
+			}
+			menuHints = append(menuHints, keyHint{"tab", "switch tab"}, keyHint{"esc", "back"})
+			s += "\n\n" + hintLine(menuHints...)
 		}
-		menuHints = append(menuHints, keyHint{"tab", "switch tab"}, keyHint{"esc", "back"})
-		s += "\n\n" + hintLine(menuHints...)
 	case stateConfirmAction:
 		s += fmt.Sprintf("Confirmation\n\n%s\n\n", m.confirmMsg)
 		if m.confirmDryRunAction != nil {
