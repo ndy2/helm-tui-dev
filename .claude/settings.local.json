@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(helm version *)",
+      "Bash(go version *)",
+      "Bash(go build *)",
+      "Bash(go mod *)",
+      "Bash(helm plugin *)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(helm env *)"
+    ]
+  }
+}

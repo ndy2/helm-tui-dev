@@ -1,0 +1,5 @@
+name: tui
+version: 0.1.0
+description: A TUI for managing helm releases with pre-defined profiles
+usage: "helm tui"
+command: "$HELM_PLUGIN_DIR/bin/helm-tui"
