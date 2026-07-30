@@ -19,6 +19,10 @@ type ReleaseProfile struct {
 
 type Config struct {
 	Contexts map[string][]ReleaseProfile `yaml:"contexts"`
+	// UIHeight is the number of release rows to show (see the --height
+	// flag). Persisted so an explicit --height becomes the default for
+	// future runs; 0 means "follow the terminal size".
+	UIHeight int `yaml:"uiHeight,omitempty"`
 }
 
 func GetConfigPath() string {

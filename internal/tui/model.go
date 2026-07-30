@@ -90,6 +90,11 @@ const (
 	maxContentWidth = 120
 	minListHeight   = 3
 	maxListHeight   = 10
+	// minFixedListHeight/maxFixedListHeight clamp the --height flag, which
+	// sets the list's row count directly (1 = 1 row) rather than a total
+	// terminal height to size chrome out of.
+	minFixedListHeight = 10
+	maxFixedListHeight = 50
 	// chromeHeight is everything drawn around the list rows (margin, the
 	// context line, the table's own borders/header/divider, and breathing
 	// room for the panel below the table). It's an estimate, not exact,
@@ -163,7 +168,7 @@ type Model struct {
 	// Window size, applied to the table/list on resize (see applyWindowSize).
 	width        int
 	height       int
-	fixedHeight  int // if >0 (set via --height), overrides the terminal-reported height
+	fixedHeight  int // if >0 (set via --height), the list's row count directly, clamped to [minFixedListHeight, maxFixedListHeight]
 	contentWidth int
 	tableCols    []components.ColumnDefinition
 }
@@ -344,11 +349,23 @@ func sortedContextNames(cfg *config.Config) []string {
 	return names
 }
 
+func clampListHeight(h int) int {
+	if h < minFixedListHeight {
+		return minFixedListHeight
+	}
+	if h > maxFixedListHeight {
+		return maxFixedListHeight
+	}
+	return h
+}
+
 // NewModel builds the initial Model. fixedHeight, if >0 (from the --height
-// flag), pins the layout height regardless of what the terminal reports via
-// tea.WindowSizeMsg - useful when running inside something that doesn't
-// report a usable size, or to constrain the app to less than the full
-// terminal. Pass 0 to always follow the terminal's reported size.
+// flag), sets the list to exactly that many rows (1 = 1 row), clamped to
+// [minFixedListHeight, maxFixedListHeight], instead of deriving it from
+// the terminal's reported size - useful when running inside something
+// that doesn't report a usable size, or to just show more/fewer releases
+// at once. Pass 0 to always follow the terminal's reported size, or a
+// previously saved --height default (see config.Config.UIHeight) if any.
 func NewModel(fixedHeight int) (*Model, error) {
 	cfg, err := config.LoadConfig()
 	if err != nil {
@@ -384,6 +401,17 @@ func NewModel(fixedHeight int) (*Model, error) {
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(styles.HighlightColor)
 
+	// fixedHeight==0 means --height wasn't passed this run - fall back to
+	// a previously saved one, if any. An explicit --height becomes the new
+	// saved default (best-effort; a failed save shouldn't block startup).
+	if fixedHeight > 0 {
+		fixedHeight = clampListHeight(fixedHeight)
+		cfg.UIHeight = fixedHeight
+		_ = cfg.Save()
+	} else if cfg.UIHeight > 0 {
+		fixedHeight = clampListHeight(cfg.UIHeight)
+	}
+
 	// Create model first so we can pass it to delegate
 	m := &Model{
 		state:             stateList,
@@ -396,9 +424,6 @@ func NewModel(fixedHeight int) (*Model, error) {
 		width:       120,
 		height:      30,
 		fixedHeight: fixedHeight,
-	}
-	if fixedHeight > 0 {
-		m.height = fixedHeight
 	}
 
 	// Initialize Table
@@ -701,12 +726,17 @@ func (m *Model) applyWindowSize() {
 		components.SetTable(&m.releaseTable, m.releaseTableCols, w)
 	}
 
-	listHeight := m.height - chromeHeight - lipgloss.Height(m.renderTabBar())
-	if listHeight < minListHeight {
-		listHeight = minListHeight
-	}
-	if listHeight > maxListHeight {
-		listHeight = maxListHeight
+	var listHeight int
+	if m.fixedHeight > 0 {
+		listHeight = m.fixedHeight
+	} else {
+		listHeight = m.height - chromeHeight - lipgloss.Height(m.renderTabBar())
+		if listHeight < minListHeight {
+			listHeight = minListHeight
+		}
+		if listHeight > maxListHeight {
+			listHeight = maxListHeight
+		}
 	}
 	m.list.SetSize(w, listHeight)
 	m.releaseList.SetSize(w, listHeight)
@@ -1463,8 +1493,8 @@ func (m *Model) View() string {
 			)
 		} else {
 			doc += "  " + hintLine(
-				keyHint{"a", "add profile"},
 				keyHint{"enter", "select"},
+				keyHint{"a", "add profile"},
 				keyHint{"e", "edit"},
 				keyHint{"u", "upgrade"},
 				keyHint{"tab", "switch tab"},
@@ -1492,12 +1522,12 @@ func (m *Model) View() string {
 			)
 		} else {
 			s += "  " + hintLine(
+				keyHint{"enter", "select"},
 				keyHint{"a", "add profile"},
 				keyHint{"e", "edit"},
 				keyHint{"u", "upgrade"},
-				keyHint{"enter", "select"},
-				keyHint{"[ ]", "switch context"},
 				keyHint{"tab", "switch tab"},
+				keyHint{"[ ]", "switch context"},
 				keyHint{"ctrl+c", "quit"},
 			)
 		}

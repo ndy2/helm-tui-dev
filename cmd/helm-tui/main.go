@@ -16,7 +16,7 @@ func main() {
 			"Flags:\n")
 		flag.PrintDefaults()
 	}
-	height := flag.Int("height", 0, "fix the UI's height in terminal rows instead of following the terminal size")
+	height := flag.Int("height", 0, "number of release rows to show (1 row = 1 release), clamped to 10-50, instead of following the terminal size; saved as the default for future runs")
 	flag.Parse()
 
 	m, err := tui.NewModel(*height)
