@@ -7,7 +7,11 @@
       "Bash(go mod *)",
       "Bash(helm plugin *)",
       "Bash(echo \"exit=$?\")",
-      "Bash(helm env *)"
+      "Bash(helm env *)",
+      "Bash(go vet *)",
+      "Bash(gofmt -l .)",
+      "Bash(git -C /home/deukyun/Desktop/repos/helm-tui status --short)",
+      "Bash(gofmt -d internal/tui/model.go)"
     ],
     "additionalDirectories": [
       "/home/deukyun/Desktop/helm-tui"

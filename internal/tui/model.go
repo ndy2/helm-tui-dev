@@ -70,6 +70,16 @@ const (
 	stateRollbackInput
 	stateExecute
 	stateInlineEdit
+	stateReleaseList
+)
+
+// tabKind selects which top-level view is active: releases grouped by the
+// current kube context, or releases grouped by name across every context.
+type tabKind int
+
+const (
+	contextTab tabKind = iota
+	releaseTab
 )
 
 const (
@@ -113,9 +123,22 @@ type Model struct {
 	currentContext    string
 	availableContexts []string
 
+	// Release tab: one flat list of every (release, context) pair across
+	// every context, grouped visually by release.
+	activeTab        tabKind
+	releaseList      list.Model
+	releaseTable     table.Model
+	releaseTableCols []components.ColumnDefinition
+
+	// Search, shown at the right end of the tab bar ('s' to start typing).
+	// Filters both tabs' lists by release name / namespace substring match.
+	searching   bool
+	searchInput textinput.Model
+	searchQuery string
+
 	// Inline editing state
 	isEditing    bool
-	editingField int // 0: ReleaseName, 1: Namespace, 2: Chart, 3: Version, 4: RemoteValues
+	editingField int // quickEditChartVer or quickEditAppVersion
 	editingInput textinput.Model
 
 	// Form for adding profile
@@ -123,13 +146,16 @@ type Model struct {
 	focus  int
 
 	// Confirmation and Input state
-	confirmMsg    string
-	confirmAction func() tea.Cmd
-	rollbackInput textinput.Model
+	confirmMsg          string
+	confirmAction        func() tea.Cmd
+	confirmDryRunAction  func() tea.Cmd // non-nil only for upgrade/install confirmations
+	confirmCancelState   sessionState   // where "n"/esc returns to
+	rollbackInput        textinput.Model
 
 	// For command execution
 	helmClient   *helm.Client
 	output       string
+	lastCommand  string // the "helm ..." line the last startHelmCmd ran, shown with the result
 	loading      bool
 	loadingLabel string
 	spinner      spinner.Model
@@ -149,14 +175,72 @@ func (i releaseItem) Title() string       { return i.profile.ReleaseName }
 func (i releaseItem) Description() string { return i.profile.Namespace }
 func (i releaseItem) FilterValue() string { return i.Title() }
 
+// appVersionPattern matches a semantic version optionally followed by a
+// pre-release/build suffix (e.g. "1.0.1.1-AIE-948-7-SNAPSHOT"), as it
+// appears embedded in a RemoteValues URL.
+var appVersionPattern = regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+(?:-[a-zA-Z0-9\.\-]+)?)`)
+
+// releaseWordPattern and snapshotWordPattern match the "release"/"snapshot"
+// repository-channel word in an Artifactory-style URL path segment, e.g.
+// ".../lml-generic-release-local/...".
+var releaseWordPattern = regexp.MustCompile(`\brelease\b`)
+var snapshotWordPattern = regexp.MustCompile(`\bsnapshot\b`)
+
 func extractAppVersion(url string) string {
-	// Matches versions like 4.6.150.2 or 1.0.1.1-AIE-948-7-SNAPSHOT
-	re := regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+(?:-[a-zA-Z0-9\.\-]+)?)`)
-	match := re.FindString(url)
+	match := appVersionPattern.FindString(url)
 	if match == "" {
 		return "N/A"
 	}
 	return match
+}
+
+// applyAppVersion substitutes newVer into url's embedded version. If newVer
+// looks like a snapshot build (contains "SNAPSHOT"), it also repoints the
+// Artifactory repo-channel segment from release to snapshot (e.g.
+// "lml-generic-release-local" -> "lml-generic-snapshot-local"), and vice
+// versa for a plain release version - so quick-editing just the App
+// Version is enough to also switch which Artifactory repo it's pulled from.
+func applyAppVersion(url, newVer string) string {
+	result := appVersionPattern.ReplaceAllString(url, newVer)
+	if strings.Contains(strings.ToUpper(newVer), "SNAPSHOT") {
+		return releaseWordPattern.ReplaceAllString(result, "snapshot")
+	}
+	return snapshotWordPattern.ReplaceAllString(result, "release")
+}
+
+// renderRow lays out fields under cols the same way the table header does
+// (see components.SetTable), so list rows line up with the header cells
+// above them. The cursor prefix eats into the first column's width, and
+// each field but the last is truncated to width-1 so a fully-truncated
+// value doesn't run straight into the next column.
+func renderRow(cols []table.Column, selected bool, fields []string) string {
+	cursor := "  "
+	if selected {
+		cursor = "● "
+	}
+
+	var b strings.Builder
+	b.WriteString(cursor)
+	for idx, field := range fields {
+		width := 0
+		if idx < len(cols) {
+			width = cols[idx].Width
+		}
+		if idx == 0 {
+			width = max(width-2, 0)
+		}
+		truncWidth := width
+		if idx < len(fields)-1 {
+			truncWidth = max(width-1, 0)
+		}
+		fmt.Fprintf(&b, "%-*s", width, runewidth.Truncate(field, truncWidth, "…"))
+	}
+
+	rowStyle := normalStyle
+	if selected {
+		rowStyle = selectedStyle
+	}
+	return rowStyle.Render(b.String())
 }
 
 type releaseDelegate struct {
@@ -174,59 +258,89 @@ func (d releaseDelegate) Render(w io.Writer, m list.Model, index int, item list.
 
 	selected := index == m.Index()
 
-	rowStyle := normalStyle
-	if selected {
-		rowStyle = selectedStyle
-	}
-
-	// Inline Editing logic
+	// Inline Editing logic. Only Chart Version and App Version are
+	// quick-editable (see quickEditChartVer/quickEditAppVersion) - Release
+	// Name and Namespace are shown but not part of the edit cycle.
 	fields := []string{
 		i.profile.ReleaseName,
 		i.profile.Namespace,
-		i.profile.Chart,
 		i.profile.Version,
 		appVer,
 	}
 
-	for idx := range fields {
-		if selected && d.model.isEditing && d.model.editingField == idx {
-			fields[idx] = fmt.Sprintf("[%s]", d.model.editingInput.View())
+	if selected && d.model.isEditing {
+		col := d.model.editingField + 2 // fields[2]=chart ver, fields[3]=app version
+		if col >= 0 && col < len(fields) {
+			fields[col] = fmt.Sprintf("[%s]", d.model.editingInput.View())
 		}
 	}
 
-	cursor := "  "
-	if selected {
-		cursor = "● " // "● "
+	fmt.Fprintf(w, "%s", renderRow(d.model.table.Columns(), selected, fields))
+}
+
+// releaseRowItem is a row in the Release tab's flat list: one (release,
+// context) pair - i.e. one profile, wherever in Config.Contexts it lives.
+type releaseRowItem struct {
+	context string
+	profile config.ReleaseProfile
+}
+
+func (i releaseRowItem) Title() string       { return i.profile.ReleaseName }
+func (i releaseRowItem) Description() string { return i.context }
+func (i releaseRowItem) FilterValue() string { return i.profile.ReleaseName + " " + i.context }
+
+// quickEditChartVer/quickEditAppVersion index the only two fields quick
+// edit ever touches, on both tabs: Release Name/Namespace/Chart are only
+// editable via the full "Edit Profile" form, since bumping versions is by
+// far the most common quick edit and the only one worth a fast path.
+const (
+	quickEditChartVer int = iota
+	quickEditAppVersion
+)
+
+type releaseRowDelegate struct {
+	model *Model
+}
+
+func (d releaseRowDelegate) Height() int  { return 1 }
+func (d releaseRowDelegate) Spacing() int { return 0 }
+func (d releaseRowDelegate) Update(msg tea.Msg, m *list.Model) tea.Cmd {
+	return nil
+}
+func (d releaseRowDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
+	i := item.(releaseRowItem)
+	selected := index == m.Index()
+
+	// Blank the RELEASE cell on every row but the first for a given
+	// release, so consecutive rows for the same release read as one
+	// merged group instead of repeating the name.
+	releaseName := i.profile.ReleaseName
+	if index > 0 {
+		if prev, ok := m.Items()[index-1].(releaseRowItem); ok && prev.profile.ReleaseName == releaseName {
+			releaseName = ""
+		}
 	}
 
-	// Use the same column widths the header uses (see components.SetTable)
-	// so row cells line up under the header cells. The cursor prefix eats
-	// into the first column's width, same as the header's first column.
-	// Fields are truncated to their column width (same as the table
-	// header's own cells) so a long value can't push later columns out of
-	// alignment or wrap the row onto an extra line, especially in a
-	// narrow terminal.
-	cols := d.model.table.Columns()
-	var b strings.Builder
-	b.WriteString(cursor)
-	for idx, field := range fields {
-		width := 0
-		if idx < len(cols) {
-			width = cols[idx].Width
+	fields := []string{releaseName, i.context, i.profile.Namespace, i.profile.Version, extractAppVersion(i.profile.RemoteValues)}
+
+	if selected && d.model.isEditing {
+		col := d.model.editingField + 3 // fields[3]=chart ver, fields[4]=app version
+		if col >= 0 && col < len(fields) {
+			fields[col] = fmt.Sprintf("[%s]", d.model.editingInput.View())
 		}
-		if idx == 0 {
-			width = max(width-2, 0)
-		}
-		// Reserve a 1-char gap so a fully-truncated value doesn't run
-		// straight into the next column; the last column doesn't need it.
-		truncWidth := width
-		if idx < len(fields)-1 {
-			truncWidth = max(width-1, 0)
-		}
-		fmt.Fprintf(&b, "%-*s", width, runewidth.Truncate(field, truncWidth, "…"))
 	}
 
-	fmt.Fprintf(w, "%s", rowStyle.Render(b.String()))
+	fmt.Fprintf(w, "%s", renderRow(d.model.releaseTable.Columns(), selected, fields))
+}
+
+// sortedContextNames returns the context names present in cfg, sorted.
+func sortedContextNames(cfg *config.Config) []string {
+	names := make([]string, 0, len(cfg.Contexts))
+	for name := range cfg.Contexts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func NewModel() (*Model, error) {
@@ -235,17 +349,29 @@ func NewModel() (*Model, error) {
 		return nil, err
 	}
 
+	// configContexts are the context names already present in the loaded
+	// YAML, sorted. When kubectl can't tell us the real current context
+	// (not installed, no kubeconfig, etc.), falling back to the first of
+	// these - instead of a synthetic "unknown" - lets a multi-context YAML
+	// be browsed/tested without a real cluster.
+	configContexts := sortedContextNames(cfg)
+
 	ctx, err := kube.GetCurrentContext()
 	if err != nil {
-		ctx = "unknown"
+		if len(configContexts) > 0 {
+			ctx = configContexts[0]
+		} else {
+			ctx = "unknown"
+		}
 	}
 
 	availableContexts, err := kube.ListContexts()
 	if err != nil || len(availableContexts) == 0 {
-		// kubectl isn't usable (not installed, no kubeconfig, etc.) - fall
-		// back to just the one context so '['/']' become a no-op instead
-		// of erroring.
-		availableContexts = []string{ctx}
+		if len(configContexts) > 0 {
+			availableContexts = configContexts
+		} else {
+			availableContexts = []string{ctx}
+		}
 	}
 
 	sp := spinner.New()
@@ -270,9 +396,8 @@ func NewModel() (*Model, error) {
 	m.tableCols = []components.ColumnDefinition{
 		{Title: "RELEASE", Width: 20},
 		{Title: "NAMESPACE", Width: 15},
-		{Title: "CHART", FlexFactor: 3},
 		{Title: "CHART VER", Width: 12},
-		{Title: "APP VERSION", FlexFactor: 2},
+		{Title: "APP VERSION", FlexFactor: 1},
 	}
 
 	l := list.New(m.sortedListItems(ctx), releaseDelegate{model: m}, 0, 0)
@@ -280,34 +405,89 @@ func NewModel() (*Model, error) {
 	l.SetShowStatusBar(false)
 	l.SetFilteringEnabled(false)
 	l.SetShowHelp(false)
+	l.InfiniteScrolling = true // down past the last item wraps to the first, and vice versa
+	// bubbles' default list keymap binds both "q" and "esc" to its own
+	// internal quit - which returns tea.Quit straight out of Update() and
+	// would silently exit the whole app on a bare esc/q press while
+	// browsing. The app manages its own quit key (ctrl+c) and esc
+	// behavior, so disable list's.
+	l.DisableQuitKeybindings()
 	m.list = l
+
+	// Release tab: flat (release, context) list
+	m.releaseTableCols = []components.ColumnDefinition{
+		{Title: "RELEASE", Width: 22},
+		{Title: "CONTEXT", Width: 17},
+		{Title: "NAMESPACE", Width: 13},
+		{Title: "CHART VER", Width: 12},
+		{Title: "APP VERSION", FlexFactor: 1},
+	}
+	m.releaseTable = components.GenerateTable()
+
+	rl := list.New(m.releaseRowListItems(), releaseRowDelegate{model: m}, 0, 0)
+	rl.SetShowTitle(false)
+	rl.SetShowStatusBar(false)
+	rl.SetFilteringEnabled(false)
+	rl.SetShowHelp(false)
+	rl.InfiniteScrolling = true
+	rl.DisableQuitKeybindings()
+	m.releaseList = rl
 
 	m.applyWindowSize()
 
 	return m, nil
 }
 
-// sortedListItems returns the release items for ctx sorted by LastSelected
-// (desc) then ReleaseName (asc).
+// matchesSearch reports whether p's release name or namespace contains
+// query (case-insensitive). An empty query matches everything.
+func matchesSearch(query string, p config.ReleaseProfile) bool {
+	if query == "" {
+		return true
+	}
+	q := strings.ToLower(query)
+	return strings.Contains(strings.ToLower(p.ReleaseName), q) || strings.Contains(strings.ToLower(p.Namespace), q)
+}
+
+// sortedListItems returns the release items for ctx matching the active
+// search query (see matchesSearch), sorted by LastSelected (desc) then
+// ReleaseName (asc).
 func (m *Model) sortedListItems(ctx string) []list.Item {
 	releases := m.config.GetReleasesForContext(ctx)
-	sort.Slice(releases, func(i, j int) bool {
-		if releases[i].LastSelected != releases[j].LastSelected {
-			return releases[i].LastSelected > releases[j].LastSelected
+	filtered := make([]config.ReleaseProfile, 0, len(releases))
+	for _, r := range releases {
+		if matchesSearch(m.searchQuery, r) {
+			filtered = append(filtered, r)
 		}
-		return releases[i].ReleaseName < releases[j].ReleaseName
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].LastSelected != filtered[j].LastSelected {
+			return filtered[i].LastSelected > filtered[j].LastSelected
+		}
+		return filtered[i].ReleaseName < filtered[j].ReleaseName
 	})
 
-	items := make([]list.Item, 0, len(releases))
-	for _, r := range releases {
+	items := make([]list.Item, 0, len(filtered))
+	for _, r := range filtered {
 		items = append(items, releaseItem{profile: r})
 	}
 	return items
 }
 
+// setContext applies name via kubectl so it also takes effect outside the
+// TUI, and reloads the context tab's release list for it. The local switch
+// always happens, even if kubectl fails or isn't installed (e.g. testing a
+// multi-context YAML with no cluster available) - the error is still
+// recorded so it's visible, it just doesn't block browsing.
+func (m *Model) setContext(name string) error {
+	err := kube.UseContext(name)
+	m.err = err
+	m.currentContext = name
+	m.list.SetItems(m.sortedListItems(name))
+	return err
+}
+
 // switchContext moves the current kubernetes context by delta (+1/-1)
-// within availableContexts, applies it via kubectl so it also takes effect
-// outside the TUI, and reloads the release list for the new context.
+// within availableContexts and applies it via setContext.
 func (m *Model) switchContext(delta int) {
 	n := len(m.availableContexts)
 	if n <= 1 {
@@ -322,16 +502,157 @@ func (m *Model) switchContext(delta int) {
 		}
 	}
 	idx = ((idx+delta)%n + n) % n
-	newCtx := m.availableContexts[idx]
+	m.setContext(m.availableContexts[idx])
+}
 
-	if err := kube.UseContext(newCtx); err != nil {
-		m.err = err
+// releaseRowListItems returns every (context, profile) pair across every
+// context matching the active search query (see matchesSearch), sorted by
+// ReleaseName then context, for the Release tab's flat list.
+func (m *Model) releaseRowListItems() []list.Item {
+	type row struct {
+		ctx     string
+		profile config.ReleaseProfile
+	}
+	var rows []row
+	for ctx, profiles := range m.config.Contexts {
+		for _, p := range profiles {
+			if !matchesSearch(m.searchQuery, p) {
+				continue
+			}
+			rows = append(rows, row{ctx: ctx, profile: p})
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].profile.ReleaseName != rows[j].profile.ReleaseName {
+			return rows[i].profile.ReleaseName < rows[j].profile.ReleaseName
+		}
+		return rows[i].ctx < rows[j].ctx
+	})
+
+	items := make([]list.Item, 0, len(rows))
+	for _, r := range rows {
+		items = append(items, releaseRowItem{context: r.ctx, profile: r.profile})
+	}
+	return items
+}
+
+// refreshLists recomputes every list that could be affected by a config
+// mutation (add/edit/delete profile), so the Context and Release tabs stay
+// in sync regardless of which tab the mutation happened in.
+func (m *Model) refreshLists() {
+	m.list.SetItems(m.sortedListItems(m.currentContext))
+	m.releaseList.SetItems(m.releaseRowListItems())
+}
+
+// isTyping reports whether a text input currently owns the keyboard (quick
+// edit, search, or one of the profile forms), so global single-key
+// shortcuts like "q" and "s" should be treated as ordinary characters
+// instead.
+func (m *Model) isTyping() bool {
+	if m.isEditing || m.searching {
+		return true
+	}
+	switch m.state {
+	case stateAddProfile, stateEditProfile, stateRollbackInput, stateInlineEdit:
+		return true
+	}
+	return false
+}
+
+// canSwitchTab reports whether the tab/shift+tab key should toggle the
+// active tab right now, rather than being handled by the current state
+// (form field navigation, inline-edit field navigation, etc.).
+func (m *Model) canSwitchTab() bool {
+	if m.isTyping() {
+		return false
+	}
+	switch m.state {
+	case stateList, stateReleaseList, stateMenu:
+		return true
+	}
+	return false
+}
+
+// switchTab toggles the active tab and moves to that tab's top-level
+// browsing state.
+func (m *Model) switchTab() {
+	if m.activeTab == contextTab {
+		m.activeTab = releaseTab
+		m.state = stateReleaseList
+	} else {
+		m.activeTab = contextTab
+		m.state = stateList
+	}
+	m.refreshLists()
+}
+
+// backState is the state to return to when backing out of the shared
+// stateMenu/stateExecute/etc. flow, depending on which tab it was entered
+// from.
+func (m *Model) backState() sessionState {
+	if m.activeTab == releaseTab {
+		return stateReleaseList
+	}
+	return stateList
+}
+
+// navigateSelection moves the active tab's underlying list cursor per msg
+// (an up/down key) and updates m.selected (and, on the Release tab, the
+// active context) to match - so the action menu can stay open on stateMenu
+// while the user arrows through releases.
+func (m *Model) navigateSelection(msg tea.KeyMsg) tea.Cmd {
+	if m.activeTab == releaseTab {
+		var cmd tea.Cmd
+		m.releaseList, cmd = m.releaseList.Update(msg)
+		if item, ok := m.releaseList.SelectedItem().(releaseRowItem); ok {
+			m.setContext(item.context)
+			m.selected = item.profile
+		}
+		return cmd
+	}
+	var cmd tea.Cmd
+	m.list, cmd = m.list.Update(msg)
+	if item, ok := m.list.SelectedItem().(releaseItem); ok {
+		m.selected = item.profile
+	}
+	return cmd
+}
+
+// switchMenuContext moves the active kube context by delta (see
+// switchContext) while staying in stateMenu if possible: it looks for a
+// profile with the same ReleaseName as the currently selected one in the
+// new context and keeps that selected (syncing the Context tab's list
+// cursor to match), so "[" / "]" work from the selected state the same way
+// they do while browsing. If the new context has no release by that name,
+// there's nothing sensible left to show in the menu, so it backs out to
+// the tab's top-level list instead. Only called for the Context tab - on
+// the Release tab, up/down already moves between a release's contexts
+// (adjacent rows in the flat list), so a separate context switch would be
+// redundant and could land on an arbitrary, unrelated context.
+func (m *Model) switchMenuContext(delta int) {
+	name := m.selected.ReleaseName
+	m.switchContext(delta)
+
+	found := false
+	for _, p := range m.config.Contexts[m.currentContext] {
+		if p.ReleaseName == name {
+			m.selected = p
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.state = m.backState()
 		return
 	}
-
-	m.err = nil
-	m.currentContext = newCtx
-	m.list.SetItems(m.sortedListItems(newCtx))
+	if m.activeTab == contextTab {
+		for i, it := range m.list.Items() {
+			if ri, ok := it.(releaseItem); ok && ri.profile.ReleaseName == name {
+				m.list.Select(i)
+				break
+			}
+		}
+	}
 }
 
 // applyWindowSize recomputes the table's column widths and the list's
@@ -352,8 +673,11 @@ func (m *Model) applyWindowSize() {
 	if len(m.tableCols) > 0 {
 		components.SetTable(&m.table, m.tableCols, w)
 	}
+	if len(m.releaseTableCols) > 0 {
+		components.SetTable(&m.releaseTable, m.releaseTableCols, w)
+	}
 
-	listHeight := m.height - chromeHeight
+	listHeight := m.height - chromeHeight - lipgloss.Height(m.renderTabBar())
 	if listHeight < minListHeight {
 		listHeight = minListHeight
 	}
@@ -361,16 +685,62 @@ func (m *Model) applyWindowSize() {
 		listHeight = maxListHeight
 	}
 	m.list.SetSize(w, listHeight)
+	m.releaseList.SetSize(w, listHeight)
 }
 
 // startHelmCmd switches to the execute view, shows a spinner with the given
 // label, and runs fn on a background goroutine (via tea.Cmd) so the UI never
 // blocks on a helm CLI call. The result comes back as a helmResultMsg.
-func (m *Model) startHelmCmd(label string, fn func() (string, error)) tea.Cmd {
+// startHelmCmd switches to the execute view and runs fn in the background.
+// command is the exact "helm ..." line fn runs (see helm.MultilineCommandString),
+// shown alongside the result once it completes.
+func (m *Model) startHelmCmd(label, command string, fn func() (string, error)) tea.Cmd {
 	m.state = stateExecute
 	m.loading = true
 	m.loadingLabel = label
+	m.lastCommand = command
 	return tea.Batch(helmCmd(fn), m.spinner.Tick)
+}
+
+// confirmUpgrade and confirmInstall put the model into stateConfirmAction
+// showing the exact helm command that would run, so upgrade/install always
+// require an explicit yes before touching the cluster. cancelState is
+// where "n"/esc returns to. "d" runs the same command with --dry-run
+// instead, without leaving the confirmation's safety net.
+func (m *Model) confirmUpgrade(profile config.ReleaseProfile, cancelState sessionState) {
+	cmdStr := helm.MultilineCommandString(helm.UpgradeArgs(profile, false))
+	dryCmdStr := helm.MultilineCommandString(helm.UpgradeArgs(profile, true))
+	m.confirmMsg = fmt.Sprintf("Run this command?\n\n%s", cmdStr)
+	m.confirmCancelState = cancelState
+	m.confirmAction = func() tea.Cmd {
+		return m.startHelmCmd(fmt.Sprintf("Upgrading %s...", profile.ReleaseName), cmdStr, func() (string, error) {
+			return m.helmClient.Upgrade(profile, false)
+		})
+	}
+	m.confirmDryRunAction = func() tea.Cmd {
+		return m.startHelmCmd(fmt.Sprintf("Dry-run upgrading %s...", profile.ReleaseName), dryCmdStr, func() (string, error) {
+			return m.helmClient.Upgrade(profile, true)
+		})
+	}
+	m.state = stateConfirmAction
+}
+
+func (m *Model) confirmInstall(profile config.ReleaseProfile, cancelState sessionState) {
+	cmdStr := helm.MultilineCommandString(helm.InstallArgs(profile, false))
+	dryCmdStr := helm.MultilineCommandString(helm.InstallArgs(profile, true))
+	m.confirmMsg = fmt.Sprintf("Run this command?\n\n%s", cmdStr)
+	m.confirmCancelState = cancelState
+	m.confirmAction = func() tea.Cmd {
+		return m.startHelmCmd(fmt.Sprintf("Installing %s...", profile.ReleaseName), cmdStr, func() (string, error) {
+			return m.helmClient.Install(profile, false)
+		})
+	}
+	m.confirmDryRunAction = func() tea.Cmd {
+		return m.startHelmCmd(fmt.Sprintf("Dry-run installing %s...", profile.ReleaseName), dryCmdStr, func() (string, error) {
+			return m.helmClient.Install(profile, true)
+		})
+	}
+	m.state = stateConfirmAction
 }
 
 func (m *Model) Init() tea.Cmd {
@@ -403,10 +773,177 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, spinCmd = m.spinner.Update(msg)
 		return m, spinCmd
 	case tea.KeyMsg:
-		// Handle global keys first
+		// Handle global keys first. Plain "q" only quits outside of any
+		// text input - otherwise typing a release/namespace name (or
+		// search query) containing "q" would quit the app.
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c":
 			return m, tea.Quit
+		case "q":
+			if !m.isTyping() {
+				return m, tea.Quit
+			}
+		}
+
+		if (msg.String() == "tab" || msg.String() == "shift+tab") && m.canSwitchTab() {
+			m.switchTab()
+			return m, nil
+		}
+
+		if msg.String() == "s" && !m.searching && !m.isTyping() && (m.state == stateList || m.state == stateReleaseList) {
+			m.searching = true
+			m.searchInput = textinput.New()
+			m.searchInput.Placeholder = "search release/namespace"
+			m.searchInput.SetValue(m.searchQuery)
+			m.searchInput.CursorEnd()
+			m.searchInput.Focus()
+			return m, textinput.Blink
+		}
+
+		if m.searching {
+			if msg.String() == "up" || msg.String() == "down" {
+				// Let the arrow keys move the selection in the filtered
+				// list without leaving the search box, so results can be
+				// browsed while still typing/refining the query.
+				var cmd tea.Cmd
+				if m.state == stateReleaseList {
+					m.releaseList, cmd = m.releaseList.Update(msg)
+				} else {
+					m.list, cmd = m.list.Update(msg)
+				}
+				return m, cmd
+			}
+			if msg.String() == "esc" {
+				m.searching = false
+				m.searchQuery = ""
+				m.refreshLists()
+				return m, nil
+			}
+			if msg.String() == "enter" {
+				m.searching = false
+				return m, nil
+			}
+			var cmd tea.Cmd
+			m.searchInput, cmd = m.searchInput.Update(msg)
+			m.searchQuery = m.searchInput.Value()
+			m.refreshLists()
+			return m, cmd
+		}
+
+		if m.state == stateReleaseList {
+			// Handle quick-edit (Chart Version / App Version) first, same
+			// shape as stateList's inline editing below.
+			if m.isEditing {
+				if msg.String() == "esc" {
+					m.isEditing = false
+					return m, nil
+				}
+				if msg.String() == "enter" {
+					item, ok := m.releaseList.SelectedItem().(releaseRowItem)
+					if !ok {
+						m.isEditing = false
+						return m, nil
+					}
+					p := item.profile
+
+					switch m.editingField {
+					case quickEditChartVer:
+						p.Version = m.editingInput.Value()
+					case quickEditAppVersion:
+						p.RemoteValues = applyAppVersion(p.RemoteValues, m.editingInput.Value())
+					}
+
+					releases := m.config.Contexts[item.context]
+					for i, r := range releases {
+						if r.ReleaseName == item.profile.ReleaseName {
+							m.config.Contexts[item.context][i] = p
+							break
+						}
+					}
+					if err := m.config.Save(); err != nil {
+						m.err = err
+					} else {
+						m.refreshLists()
+					}
+					m.isEditing = false
+					return m, nil
+				}
+				if msg.String() == "tab" || msg.String() == "shift+tab" {
+					m.editingField = (m.editingField + 1) % 2
+					if item, ok := m.releaseList.SelectedItem().(releaseRowItem); ok {
+						var val string
+						switch m.editingField {
+						case quickEditChartVer:
+							val = item.profile.Version
+						case quickEditAppVersion:
+							val = extractAppVersion(item.profile.RemoteValues)
+						}
+						m.editingInput.SetValue(val)
+					}
+					return m, nil
+				}
+				var editCmd tea.Cmd
+				m.editingInput, editCmd = m.editingInput.Update(msg)
+				return m, editCmd
+			}
+
+			var listCmd tea.Cmd
+			m.releaseList, listCmd = m.releaseList.Update(msg)
+
+			if msg.String() == "esc" && m.searchQuery != "" {
+				m.searchQuery = ""
+				m.refreshLists()
+				return m, nil
+			}
+			if msg.String() == "enter" {
+				item, ok := m.releaseList.SelectedItem().(releaseRowItem)
+				if !ok {
+					return m, listCmd
+				}
+				m.setContext(item.context)
+
+				for i := range m.config.Contexts[m.currentContext] {
+					if m.config.Contexts[m.currentContext][i].ReleaseName == item.profile.ReleaseName {
+						m.config.Contexts[m.currentContext][i].LastSelected = time.Now().Unix()
+						break
+					}
+				}
+				if err := m.config.Save(); err != nil {
+					m.err = err
+				}
+
+				m.state = stateMenu
+				m.selected = item.profile
+				return m, nil
+			}
+			if msg.String() == "e" {
+				item, ok := m.releaseList.SelectedItem().(releaseRowItem)
+				if !ok {
+					return m, listCmd
+				}
+				m.isEditing = true
+				m.editingField = quickEditAppVersion // same default as the Context tab's quick edit
+				m.editingInput = textinput.New()
+				m.editingInput.SetValue(extractAppVersion(item.profile.RemoteValues))
+				m.editingInput.Focus()
+				return m, nil
+			}
+			if msg.String() == "u" {
+				item, ok := m.releaseList.SelectedItem().(releaseRowItem)
+				if !ok {
+					return m, listCmd
+				}
+				m.setContext(item.context)
+				m.selected = item.profile
+				m.confirmUpgrade(m.selected, stateReleaseList)
+				return m, nil
+			}
+			if msg.String() == "a" {
+				m.setupAddProfileForm()
+				m.state = stateAddProfile
+				return m, m.inputs[m.focus].Focus()
+			}
+			return m, listCmd
 		}
 
 		if m.state == stateList {
@@ -422,16 +959,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					p := selectedItem.profile
 
 					switch m.editingField {
-					case 0: p.ReleaseName = m.editingInput.Value()
-					case 1: p.Namespace = m.editingInput.Value()
-					case 2: p.Chart = m.editingInput.Value()
-					case 3: p.Version = m.editingInput.Value()
-					case 4:
-						// Replace the version part in the RemoteValues URL
-						currentVal := p.RemoteValues
-						newVer := m.editingInput.Value()
-						re := regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+(?:-[a-zA-Z0-9\.\-]+)?)`)
-						p.RemoteValues = re.ReplaceAllString(currentVal, newVer)
+					case quickEditChartVer:
+						p.Version = m.editingInput.Value()
+					case quickEditAppVersion:
+						p.RemoteValues = applyAppVersion(p.RemoteValues, m.editingInput.Value())
 					}
 
 					releases := m.config.Contexts[m.currentContext]
@@ -444,44 +975,22 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if err := m.config.Save(); err != nil {
 						m.err = err
 					} else {
-						var items []list.Item
-						updatedReleases := m.config.GetReleasesForContext(m.currentContext)
-						for _, r := range updatedReleases {
-							items = append(items, releaseItem{profile: r})
-						}
-						m.list.SetItems(items)
+						m.refreshLists()
 					}
 					m.isEditing = false
 					return m, nil
 				}
-				if msg.String() == "tab" {
-					m.editingField = (m.editingField + 1) % 5
+				if msg.String() == "tab" || msg.String() == "shift+tab" {
+					m.editingField = (m.editingField + 1) % 2
 					selectedItem := m.list.SelectedItem().(releaseItem)
 					p := selectedItem.profile
 
 					var val string
 					switch m.editingField {
-					case 0: val = p.ReleaseName
-					case 1: val = p.Namespace
-					case 2: val = p.Chart
-					case 3: val = p.Version
-					case 4: val = extractAppVersion(p.RemoteValues)
-					}
-					m.editingInput.SetValue(val)
-					return m, nil
-				}
-				if msg.String() == "shift+tab" {
-					m.editingField = (m.editingField - 1 + 5) % 5
-					selectedItem := m.list.SelectedItem().(releaseItem)
-					p := selectedItem.profile
-
-					var val string
-					switch m.editingField {
-					case 0: val = p.ReleaseName
-					case 1: val = p.Namespace
-					case 2: val = p.Chart
-					case 3: val = p.Version
-					case 4: val = extractAppVersion(p.RemoteValues)
+					case quickEditChartVer:
+						val = p.Version
+					case quickEditAppVersion:
+						val = extractAppVersion(p.RemoteValues)
 					}
 					m.editingInput.SetValue(val)
 					return m, nil
@@ -497,6 +1006,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var listCmd tea.Cmd
 			m.list, listCmd = m.list.Update(msg)
 
+			if msg.String() == "esc" && m.searchQuery != "" {
+				m.searchQuery = ""
+				m.refreshLists()
+				return m, nil
+			}
 			if msg.String() == "enter" {
 				releases := m.config.GetReleasesForContext(m.currentContext)
 				if len(releases) == 0 {
@@ -535,7 +1049,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.String() == "e" {
 				selectedItem := m.list.SelectedItem().(releaseItem)
 				m.isEditing = true
-				m.editingField = 4 // Default to App Version (Remote Values)
+				m.editingField = quickEditAppVersion
 
 				m.editingInput = textinput.New()
 				m.editingInput.SetValue(extractAppVersion(selectedItem.profile.RemoteValues))
@@ -550,16 +1064,25 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				selectedItem := m.list.SelectedItem().(releaseItem)
 				m.selected = selectedItem.profile
-
-				profile := m.selected
-				return m, m.startHelmCmd(fmt.Sprintf("Upgrading %s...", profile.ReleaseName), func() (string, error) {
-					return m.helmClient.Upgrade(profile)
-				})
+				m.confirmUpgrade(m.selected, stateList)
+				return m, nil
 			}
 			return m, listCmd
 		} else if m.state == stateMenu {
+			if msg.String() == "up" || msg.String() == "down" {
+				cmd := m.navigateSelection(msg)
+				return m, cmd
+			}
+			if msg.String() == "[" && m.activeTab == contextTab {
+				m.switchMenuContext(-1)
+				return m, nil
+			}
+			if msg.String() == "]" && m.activeTab == contextTab {
+				m.switchMenuContext(1)
+				return m, nil
+			}
 			if msg.String() == "esc" {
-				m.state = stateList
+				m.state = m.backState()
 				return m, nil
 			}
 			if msg.String() == "e" {
@@ -569,6 +1092,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if msg.String() == "x" {
 				m.confirmMsg = fmt.Sprintf("Are you sure you want to delete profile %s?", m.selected.ReleaseName)
+				m.confirmCancelState = stateMenu
+				m.confirmDryRunAction = nil
 				m.confirmAction = func() tea.Cmd {
 					// Delete profile logic
 					releases := m.config.Contexts[m.currentContext]
@@ -581,14 +1106,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if err := m.config.Save(); err != nil {
 						m.err = err
 					}
-					// Update list items
-					var items []list.Item
-					updatedReleases := m.config.GetReleasesForContext(m.currentContext)
-					for _, r := range updatedReleases {
-						items = append(items, releaseItem{profile: r})
-					}
-					m.list.SetItems(items)
-					m.state = stateList
+					m.refreshLists()
+					m.state = m.backState()
 					return nil
 				}
 				m.state = stateConfirmAction
@@ -599,17 +1118,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			switch msg.String() {
 			case "h":
-				return m, m.startHelmCmd(fmt.Sprintf("Fetching history for %s...", profile.ReleaseName), func() (string, error) {
+				cmdStr := helm.MultilineCommandString(helm.HistoryArgs(profile))
+				return m, m.startHelmCmd(fmt.Sprintf("Fetching history for %s...", profile.ReleaseName), cmdStr, func() (string, error) {
 					return m.helmClient.History(profile)
 				})
 			case "u":
-				return m, m.startHelmCmd(fmt.Sprintf("Upgrading %s...", profile.ReleaseName), func() (string, error) {
-					return m.helmClient.Upgrade(profile)
-				})
+				m.confirmUpgrade(profile, stateMenu)
+				return m, nil
 			case "i":
-				return m, m.startHelmCmd(fmt.Sprintf("Installing %s...", profile.ReleaseName), func() (string, error) {
-					return m.helmClient.Install(profile)
-				})
+				m.confirmInstall(profile, stateMenu)
+				return m, nil
 			case "r":
 				m.rollbackInput = textinput.New()
 				m.rollbackInput.Placeholder = "Revision (Enter for previous)"
@@ -617,9 +1135,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateRollbackInput
 				return m, nil
 			case "d":
-				m.confirmMsg = fmt.Sprintf("Are you sure you want to delete release %s?", profile.ReleaseName)
+				deleteCmdStr := helm.MultilineCommandString(helm.DeleteArgs(profile))
+				m.confirmMsg = fmt.Sprintf("Are you sure you want to delete release %s?\n\n%s", profile.ReleaseName, deleteCmdStr)
+				m.confirmCancelState = stateMenu
+				m.confirmDryRunAction = nil
 				m.confirmAction = func() tea.Cmd {
-					return m.startHelmCmd(fmt.Sprintf("Deleting %s...", profile.ReleaseName), func() (string, error) {
+					return m.startHelmCmd(fmt.Sprintf("Deleting %s...", profile.ReleaseName), deleteCmdStr, func() (string, error) {
 						return m.helmClient.Delete(profile)
 					})
 				}
@@ -638,11 +1159,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		} else if m.state == stateConfirmAction {
 			if msg.String() == "esc" || msg.String() == "n" {
-				m.state = stateMenu
+				m.state = m.confirmCancelState
 				return m, nil
 			}
 			if msg.String() == "y" || msg.String() == "enter" {
 				cmd := m.confirmAction()
+				return m, cmd
+			}
+			if msg.String() == "d" && m.confirmDryRunAction != nil {
+				cmd := m.confirmDryRunAction()
 				return m, cmd
 			}
 		} else if m.state == stateRollbackInput {
@@ -656,7 +1181,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					fmt.Sscanf(m.rollbackInput.Value(), "%d", &rev)
 				}
 				profile := m.selected
-				return m, m.startHelmCmd(fmt.Sprintf("Rolling back %s...", profile.ReleaseName), func() (string, error) {
+				cmdStr := helm.MultilineCommandString(helm.RollbackArgs(profile, rev))
+				return m, m.startHelmCmd(fmt.Sprintf("Rolling back %s...", profile.ReleaseName), cmdStr, func() (string, error) {
 					return m.helmClient.Rollback(profile, rev)
 				})
 			}
@@ -665,7 +1191,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		} else if m.state == stateInlineEdit {
 			if msg.String() == "esc" {
-				m.state = stateList
+				m.state = m.backState()
 				return m, nil
 			}
 			if msg.String() == "enter" {
@@ -684,13 +1210,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err := m.config.Save(); err != nil {
 					m.err = err
 				} else {
-					var items []list.Item
-					updatedReleases := m.config.GetReleasesForContext(m.currentContext)
-					for _, r := range updatedReleases {
-						items = append(items, releaseItem{profile: r})
-					}
-					m.list.SetItems(items)
-					m.state = stateList
+					m.refreshLists()
+					m.state = m.backState()
 				}
 				return m, nil
 			}
@@ -728,12 +1249,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if err := m.config.Save(); err != nil {
 						m.err = err
 					} else {
-						var items []list.Item
-						updatedReleases := m.config.GetReleasesForContext(m.currentContext)
-						for _, r := range updatedReleases {
-							items = append(items, releaseItem{profile: r})
-						}
-						m.list.SetItems(items)
+						m.refreshLists()
 						m.selected = p
 						m.state = stateMenu
 					}
@@ -746,9 +1262,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = (m.focus + 1) % len(m.inputs)
 				return m, m.inputs[m.focus].Focus()
 			}
+			if msg.String() == "shift+tab" {
+				m.focus = (m.focus - 1 + len(m.inputs)) % len(m.inputs)
+				return m, m.inputs[m.focus].Focus()
+			}
 		} else if m.state == stateAddProfile {
 			if msg.String() == "esc" {
-				m.state = stateList
+				m.state = m.backState()
 				return m, nil
 			}
 			if msg.String() == "enter" {
@@ -760,17 +1280,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						Version:      m.inputs[3].Value(),
 						RemoteValues: m.inputs[4].Value(),
 					}
-					m.config.AddRelease(m.currentContext, p)
+					targetContext := m.inputs[addProfileContextField].Value()
+					m.config.AddRelease(targetContext, p)
 					if err := m.config.Save(); err != nil {
 						m.err = err
 					} else {
-						var items []list.Item
-						releases := m.config.GetReleasesForContext(m.currentContext)
-						for _, r := range releases {
-							items = append(items, releaseItem{profile: r})
-						}
-						m.list.SetItems(items)
-						m.state = stateList
+						m.refreshLists()
+						m.state = m.backState()
 					}
 					return m, nil
 				}
@@ -779,6 +1295,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if msg.String() == "tab" {
 				m.focus = (m.focus + 1) % len(m.inputs)
+				return m, m.inputs[m.focus].Focus()
+			}
+			if msg.String() == "shift+tab" {
+				m.focus = (m.focus - 1 + len(m.inputs)) % len(m.inputs)
 				return m, m.inputs[m.focus].Focus()
 			}
 		}
@@ -792,8 +1312,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// addProfileContextField is the index of the Context field in the add
+// profile form. It's last so the other fields (shared with edit profile)
+// keep the same indices, and it's editable - unlike edit profile, which
+// updates an existing entry in place, add profile has no "current context"
+// to assume from the Release tab's flat, all-contexts list - so it's
+// prefilled with m.currentContext but can be changed to any context.
+const addProfileContextField = 5
+
 func (m *Model) setupAddProfileForm() {
-	fields := []string{"Namespace", "Release Name", "Chart", "Version", "Remote Values URL"}
+	fields := []string{"Namespace", "Release Name", "Chart", "Version", "Remote Values URL", "Context"}
 	m.inputs = make([]textinput.Model, len(fields))
 
 	for i := 0; i < len(fields); i++ {
@@ -801,6 +1329,7 @@ func (m *Model) setupAddProfileForm() {
 		t.Placeholder = fields[i]
 		m.inputs[i] = t
 	}
+	m.inputs[addProfileContextField].SetValue(m.currentContext)
 	m.focus = 0
 }
 
@@ -825,26 +1354,112 @@ func (m *Model) setupEditProfileForm() {
 	m.focus = 0
 }
 
-// renderReleasesTable renders the releases table (its title already shows
-// the current context). It is shown in every state so the table stays
-// visible while the user navigates the release menu, executes commands, or
-// fills out forms.
-func (m *Model) renderReleasesTable() string {
-	s := components.RenderTable(m.table, 15, m.contentWidth, fmt.Sprintf(" Releases [%s]", m.currentContext)) + "\n"
+// renderPanel renders a table header followed by a bordered list body
+// beneath it, the shared look used for every top-level browsing list
+// (Context tab's releases, Release tab's names and per-release contexts).
+func (m *Model) renderPanel(t table.Model, l list.Model, title string) string {
+	s := components.RenderTable(t, 15, m.contentWidth, title) + "\n"
 
-	listView := m.list.View()
 	borderStyle := lipgloss.NewStyle().
 		Border(styles.Border, false, true, true).
 		BorderForeground(lipgloss.Color("240")).
 		Padding(0, 1).
 		Width(m.contentWidth)
 
-	s += borderStyle.Render(listView)
-	return s
+	return s + borderStyle.Render(l.View())
+}
+
+// renderReleasesTable renders the releases table (its title already shows
+// the current context). It is shown in every state so the table stays
+// visible while the user navigates the release menu, executes commands, or
+// fills out forms.
+func (m *Model) renderReleasesTable() string {
+	return m.renderPanel(m.table, m.list, fmt.Sprintf(" Releases [%s]", m.currentContext))
+}
+
+// renderReleaseTable renders the Release tab's flat list: every (release,
+// context) pair across every context, grouped visually by release.
+func (m *Model) renderReleaseTable() string {
+	return m.renderPanel(m.releaseTable, m.releaseList, " Releases (all contexts) ")
+}
+
+// renderActiveTable renders whichever tab's table is active, so selecting
+// a release from the Release tab (which enters the shared stateMenu/etc.
+// flow below) keeps showing the Release tab's table instead of switching
+// to the Context tab's.
+func (m *Model) renderActiveTable() string {
+	if m.activeTab == releaseTab {
+		return m.renderReleaseTable()
+	}
+	return m.renderReleasesTable()
+}
+
+// renderTabBar renders the Context/Release tab bar shown at the top of
+// every view.
+func (m *Model) renderTabBar() string {
+	labels := []string{"Context", "Release"}
+	rendered := make([]string, len(labels))
+	for i, label := range labels {
+		style := styles.InactiveTabStyle
+		if tabKind(i) == m.activeTab {
+			style = styles.ActiveTabStyle
+		}
+		rendered[i] = style.Render(label)
+	}
+	left := lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
+	right := m.renderSearchBox()
+
+	gap := m.contentWidth - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 {
+		gap = 1
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, strings.Repeat(" ", gap), right)
+}
+
+// renderSearchBox renders the search indicator shown at the right end of
+// the tab bar: a hint while idle, the live input while typing, or the
+// active query (with a reminder that esc clears it) once confirmed.
+func (m *Model) renderSearchBox() string {
+	switch {
+	case m.searching:
+		return hintStyle.Render("search: ") + m.searchInput.View()
+	case m.searchQuery != "":
+		return hintStyle.Render("search: ") + keyStyle.Render(m.searchQuery) + hintStyle.Render("  (esc clear)")
+	default:
+		return hintLine(keyHint{"s", "search"})
+	}
 }
 
 func (m *Model) View() string {
-	s := m.renderReleasesTable() + "\n\n"
+	doc := m.renderTabBar() + "\n\n"
+
+	switch m.state {
+	case stateReleaseList:
+		doc += m.renderReleaseTable() + "\n\n"
+		if m.err != nil {
+			doc += errorStyle.Render(fmt.Sprintf("  Error: %v", m.err)) + "\n\n"
+		}
+		if len(m.releaseList.Items()) == 0 {
+			doc += "  " + hintLine(keyHint{"a", "add a new release profile"}, keyHint{"tab", "switch tab"})
+		} else if m.isEditing {
+			doc += "  " + hintStyle.Render("Editing... ") + hintLine(
+				keyHint{"tab", "switch field"},
+				keyHint{"enter", "save"},
+				keyHint{"esc", "cancel"},
+			)
+		} else {
+			doc += "  " + hintLine(
+				keyHint{"a", "add profile"},
+				keyHint{"enter", "select"},
+				keyHint{"e", "edit"},
+				keyHint{"u", "upgrade"},
+				keyHint{"tab", "switch tab"},
+			)
+		}
+		return docStyle.Render(doc)
+	}
+
+	s := doc + m.renderActiveTable() + "\n\n"
 
 	switch m.state {
 	case stateList:
@@ -853,7 +1468,7 @@ func (m *Model) View() string {
 		}
 		releases := m.config.GetReleasesForContext(m.currentContext)
 		if len(releases) == 0 {
-			s += "  " + hintLine(keyHint{"a", "add a new release profile"})
+			s += "  " + hintLine(keyHint{"a", "add a new release profile"}, keyHint{"tab", "switch tab"})
 		} else if m.isEditing {
 			s += "  " + hintStyle.Render("Editing... ") + hintLine(
 				keyHint{"tab", "switch field"},
@@ -863,9 +1478,11 @@ func (m *Model) View() string {
 		} else {
 			s += "  " + hintLine(
 				keyHint{"a", "add profile"},
-				keyHint{"e", "edit profile"},
+				keyHint{"e", "edit"},
 				keyHint{"u", "upgrade"},
-				keyHint{"enter", "select release"},
+				keyHint{"enter", "select"},
+				keyHint{"[ ]", "switch context"},
+				keyHint{"tab", "switch tab"},
 			)
 		}
 	case stateInlineEdit:
@@ -897,15 +1514,24 @@ func (m *Model) View() string {
 			keyHint{"e", "Edit Profile"},
 			keyHint{"x", "Delete Profile"},
 		)
-		s += "\n\n" + hintLine(keyHint{"esc", "back"})
+		menuHints := []keyHint{{"↑↓", "switch release"}}
+		if m.activeTab == contextTab {
+			menuHints = append(menuHints, keyHint{"[ ]", "switch context"})
+		}
+		menuHints = append(menuHints, keyHint{"tab", "switch tab"}, keyHint{"esc", "back"})
+		s += "\n\n" + hintLine(menuHints...)
 	case stateConfirmAction:
 		s += fmt.Sprintf("Confirmation\n\n%s\n\n", m.confirmMsg)
-		s += hintLine(keyHint{"y", "yes"}, keyHint{"n", "no"}, keyHint{"esc", "cancel"})
+		if m.confirmDryRunAction != nil {
+			s += hintLine(keyHint{"y", "yes"}, keyHint{"d", "dry run"}, keyHint{"n", "no"}, keyHint{"esc", "cancel"})
+		} else {
+			s += hintLine(keyHint{"y", "yes"}, keyHint{"n", "no"}, keyHint{"esc", "cancel"})
+		}
 	case stateRollbackInput:
 		s += fmt.Sprintf("Rollback %s\n\n%s\n\n", m.selected.ReleaseName, m.rollbackInput.View())
 		s += hintLine(keyHint{"enter", "execute"}, keyHint{"esc", "cancel"})
 	case stateAddProfile:
-		s += fmt.Sprintf("Add New Release Profile [%s]\n\n", m.currentContext)
+		s += "Add New Release Profile\n\n"
 		for i, input := range m.inputs {
 			cursor := "  "
 			if i == m.focus {
@@ -928,7 +1554,11 @@ func (m *Model) View() string {
 		if m.loading {
 			s += fmt.Sprintf("%s %s", m.spinner.View(), m.loadingLabel)
 		} else {
-			s += fmt.Sprintf("Execution Result for %s:\n\n%s\n\n", m.selected.ReleaseName, m.output)
+			s += fmt.Sprintf("Execution Result for %s:\n\n", m.selected.ReleaseName)
+			if m.lastCommand != "" {
+				s += m.lastCommand + "\n\n"
+			}
+			s += m.output + "\n\n"
 			s += hintLine(keyHint{"esc", "return to menu"})
 		}
 	default:
