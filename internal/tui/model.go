@@ -163,6 +163,7 @@ type Model struct {
 	// Window size, applied to the table/list on resize (see applyWindowSize).
 	width        int
 	height       int
+	fixedHeight  int // if >0 (set via --height), overrides the terminal-reported height
 	contentWidth int
 	tableCols    []components.ColumnDefinition
 }
@@ -343,7 +344,12 @@ func sortedContextNames(cfg *config.Config) []string {
 	return names
 }
 
-func NewModel() (*Model, error) {
+// NewModel builds the initial Model. fixedHeight, if >0 (from the --height
+// flag), pins the layout height regardless of what the terminal reports via
+// tea.WindowSizeMsg - useful when running inside something that doesn't
+// report a usable size, or to constrain the app to less than the full
+// terminal. Pass 0 to always follow the terminal's reported size.
+func NewModel(fixedHeight int) (*Model, error) {
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		return nil, err
@@ -387,8 +393,12 @@ func NewModel() (*Model, error) {
 		helmClient:        helm.NewClient(),
 		spinner:           sp,
 		// Sane defaults until the first tea.WindowSizeMsg arrives.
-		width:  120,
-		height: 30,
+		width:       120,
+		height:      30,
+		fixedHeight: fixedHeight,
+	}
+	if fixedHeight > 0 {
+		m.height = fixedHeight
 	}
 
 	// Initialize Table
@@ -596,6 +606,20 @@ func (m *Model) backState() sessionState {
 	return stateList
 }
 
+// fieldNavDelta returns +1/-1 if msg should move a form/quick-edit's focus
+// to the next/previous field - tab or down for next, shift+tab or up for
+// previous - or 0 if msg isn't a field-navigation key. Forms are single-line
+// text fields, so up/down have no other meaning to conflict with.
+func fieldNavDelta(msg tea.KeyMsg) int {
+	switch msg.String() {
+	case "tab", "down":
+		return 1
+	case "shift+tab", "up":
+		return -1
+	}
+	return 0
+}
+
 // navigateSelection moves the active tab's underlying list cursor per msg
 // (an up/down key) and updates m.selected (and, on the Release tab, the
 // active context) to match - so the action menu can stay open on stateMenu
@@ -753,7 +777,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
-		m.height = msg.Height
+		if m.fixedHeight <= 0 {
+			m.height = msg.Height
+		}
 		m.applyWindowSize()
 		return m, nil
 	case helmResultMsg:
@@ -868,7 +894,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.isEditing = false
 					return m, nil
 				}
-				if msg.String() == "tab" || msg.String() == "shift+tab" {
+				if fieldNavDelta(msg) != 0 {
 					m.editingField = (m.editingField + 1) % 2
 					if item, ok := m.releaseList.SelectedItem().(releaseRowItem); ok {
 						var val string
@@ -980,7 +1006,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.isEditing = false
 					return m, nil
 				}
-				if msg.String() == "tab" || msg.String() == "shift+tab" {
+				if fieldNavDelta(msg) != 0 {
 					m.editingField = (m.editingField + 1) % 2
 					selectedItem := m.list.SelectedItem().(releaseItem)
 					p := selectedItem.profile
@@ -1215,12 +1241,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-			if msg.String() == "tab" {
-				m.focus = (m.focus + 1) % len(m.inputs)
-				return m, m.inputs[m.focus].Focus()
-			}
-			if msg.String() == "shift+tab" { // Simplified representation
-				m.focus = (m.focus - 1 + len(m.inputs)) % len(m.inputs)
+			if delta := fieldNavDelta(msg); delta != 0 {
+				m.focus = (m.focus + delta + len(m.inputs)) % len(m.inputs)
 				return m, m.inputs[m.focus].Focus()
 			}
 		} else if m.state == stateEditProfile {
@@ -1258,12 +1280,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus++
 				return m, m.inputs[m.focus].Focus()
 			}
-			if msg.String() == "tab" {
-				m.focus = (m.focus + 1) % len(m.inputs)
-				return m, m.inputs[m.focus].Focus()
-			}
-			if msg.String() == "shift+tab" {
-				m.focus = (m.focus - 1 + len(m.inputs)) % len(m.inputs)
+			if delta := fieldNavDelta(msg); delta != 0 {
+				m.focus = (m.focus + delta + len(m.inputs)) % len(m.inputs)
 				return m, m.inputs[m.focus].Focus()
 			}
 		} else if m.state == stateAddProfile {
@@ -1293,12 +1311,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus++
 				return m, m.inputs[m.focus].Focus()
 			}
-			if msg.String() == "tab" {
-				m.focus = (m.focus + 1) % len(m.inputs)
-				return m, m.inputs[m.focus].Focus()
-			}
-			if msg.String() == "shift+tab" {
-				m.focus = (m.focus - 1 + len(m.inputs)) % len(m.inputs)
+			if delta := fieldNavDelta(msg); delta != 0 {
+				m.focus = (m.focus + delta + len(m.inputs)) % len(m.inputs)
 				return m, m.inputs[m.focus].Focus()
 			}
 		}
@@ -1454,6 +1468,7 @@ func (m *Model) View() string {
 				keyHint{"e", "edit"},
 				keyHint{"u", "upgrade"},
 				keyHint{"tab", "switch tab"},
+				keyHint{"ctrl+c", "quit"},
 			)
 		}
 		return docStyle.Render(doc)
@@ -1483,6 +1498,7 @@ func (m *Model) View() string {
 				keyHint{"enter", "select"},
 				keyHint{"[ ]", "switch context"},
 				keyHint{"tab", "switch tab"},
+				keyHint{"ctrl+c", "quit"},
 			)
 		}
 	case stateInlineEdit:

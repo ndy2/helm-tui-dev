@@ -10,13 +10,13 @@ import (
 	"strings"
 )
 
-// authPromptWatcher watches a running helm/kubectl process's combined
-// output for a Rancher CLI exec-credential login prompt (shown when the
-// cached auth token has expired) and answers it automatically: it always
-// picks the keyCloakProvider entry, then opens the printed login URL in
-// the user's browser so they only have to complete the SSO login there
-// instead of babysitting the terminal. Example of the prompt this reacts
-// to:
+// authPromptWatcher watches a running helm process's pty output for a
+// Rancher CLI exec-credential login prompt (shown when the cached auth
+// token has expired) and answers it automatically: it always picks the
+// keyCloakProvider entry, writing the choice back to the same pty, then
+// opens the printed login URL in the user's browser so they only have to
+// complete the SSO login there instead of babysitting the terminal.
+// Example of the prompt this reacts to:
 //
 //	Auth providers:
 //	0 - localProvider
@@ -39,12 +39,10 @@ func newAuthPromptWatcher(stdin io.Writer) *authPromptWatcher {
 
 var (
 	authProviderLineRe = regexp.MustCompile(`(?m)^\s*(\d+)\s*-\s*(\S+)\s*$`)
-	authLoginURLRe      = regexp.MustCompile(`Login to [^\n]*?(https?://\S+)`)
+	authLoginURLRe     = regexp.MustCompile(`Login to [^\n]*?(https?://\S+)`)
 )
 
-// Write implements io.Writer. It's safe to use as both Cmd.Stdout and
-// Cmd.Stderr on the same Cmd - os/exec serializes calls when both fields
-// hold the identical writer value.
+// Write implements io.Writer, fed the pty's output as execute reads it.
 func (w *authPromptWatcher) Write(p []byte) (int, error) {
 	w.buf.Write(p)
 	w.pending += string(p)
