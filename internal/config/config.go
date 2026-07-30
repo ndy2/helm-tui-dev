@@ -23,6 +23,13 @@ type Config struct {
 	// flag). Persisted so an explicit --height becomes the default for
 	// future runs; 0 means "follow the terminal size".
 	UIHeight int `yaml:"uiHeight,omitempty"`
+	// UIWidth is the table/list content width in columns (see the --width
+	// flag). Persisted so an explicit --width becomes the default for
+	// future runs; 0 means "follow the terminal size".
+	UIWidth int `yaml:"uiWidth,omitempty"`
+	// UIHelpHidden mirrors the global "h" key hint toggle, so hiding the
+	// key hints carries over to the next run.
+	UIHelpHidden bool `yaml:"uiHelpHidden,omitempty"`
 }
 
 func GetConfigPath() string {

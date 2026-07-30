@@ -58,6 +58,23 @@ func hintLines(hints ...keyHint) string {
 	return strings.Join(lines, "\n")
 }
 
+// hint and hintL wrap hintLine/hintLines, suppressing all key hints while
+// the helper is hidden (see the global "h" toggle in Update and
+// Model.helpHidden).
+func (m *Model) hint(hints ...keyHint) string {
+	if m.helpHidden {
+		return ""
+	}
+	return hintLine(hints...)
+}
+
+func (m *Model) hintL(hints ...keyHint) string {
+	if m.helpHidden {
+		return ""
+	}
+	return hintLines(hints...)
+}
+
 type sessionState int
 
 const (
@@ -165,10 +182,15 @@ type Model struct {
 	loadingLabel string
 	spinner      spinner.Model
 
+	// helpHidden hides all key hints (see the global "h" toggle in Update).
+	// Persisted via config.Config.UIHelpHidden so it carries over runs.
+	helpHidden bool
+
 	// Window size, applied to the table/list on resize (see applyWindowSize).
 	width        int
 	height       int
 	fixedHeight  int // if >0 (set via --height), the list's row count directly, clamped to [minFixedListHeight, maxFixedListHeight]
+	fixedWidth   int // if >0 (set via --width), the content width directly, clamped to [minContentWidth, maxContentWidth]
 	contentWidth int
 	tableCols    []components.ColumnDefinition
 }
@@ -359,6 +381,16 @@ func clampListHeight(h int) int {
 	return h
 }
 
+func clampContentWidth(w int) int {
+	if w < minContentWidth {
+		return minContentWidth
+	}
+	if w > maxContentWidth {
+		return maxContentWidth
+	}
+	return w
+}
+
 // NewModel builds the initial Model. fixedHeight, if >0 (from the --height
 // flag), sets the list to exactly that many rows (1 = 1 row), clamped to
 // [minFixedListHeight, maxFixedListHeight], instead of deriving it from
@@ -366,7 +398,9 @@ func clampListHeight(h int) int {
 // that doesn't report a usable size, or to just show more/fewer releases
 // at once. Pass 0 to always follow the terminal's reported size, or a
 // previously saved --height default (see config.Config.UIHeight) if any.
-func NewModel(fixedHeight int) (*Model, error) {
+// fixedWidth works the same way for the table/list content width (see
+// config.Config.UIWidth), clamped to [minContentWidth, maxContentWidth].
+func NewModel(fixedHeight, fixedWidth int) (*Model, error) {
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		return nil, err
@@ -412,6 +446,15 @@ func NewModel(fixedHeight int) (*Model, error) {
 		fixedHeight = clampListHeight(cfg.UIHeight)
 	}
 
+	// Same save-as-default behavior as --height, but for content width.
+	if fixedWidth > 0 {
+		fixedWidth = clampContentWidth(fixedWidth)
+		cfg.UIWidth = fixedWidth
+		_ = cfg.Save()
+	} else if cfg.UIWidth > 0 {
+		fixedWidth = clampContentWidth(cfg.UIWidth)
+	}
+
 	// Create model first so we can pass it to delegate
 	m := &Model{
 		state:             stateList,
@@ -424,6 +467,8 @@ func NewModel(fixedHeight int) (*Model, error) {
 		width:       120,
 		height:      30,
 		fixedHeight: fixedHeight,
+		fixedWidth:  fixedWidth,
+		helpHidden:  cfg.UIHelpHidden,
 	}
 
 	// Initialize Table
@@ -708,14 +753,19 @@ func (m *Model) switchMenuContext(delta int) {
 // height from the model's current width/height, clamped to a usable
 // range. Called on startup and on every tea.WindowSizeMsg.
 func (m *Model) applyWindowSize() {
-	// docStyle's outer margin (2 cols each side) plus the table's own
-	// left/right border (1 col each side) sit outside the content width.
-	w := m.width - 6
-	if w < minContentWidth {
-		w = minContentWidth
-	}
-	if w > maxContentWidth {
-		w = maxContentWidth
+	var w int
+	if m.fixedWidth > 0 {
+		w = m.fixedWidth
+	} else {
+		// docStyle's outer margin (2 cols each side) plus the table's own
+		// left/right border (1 col each side) sit outside the content width.
+		w = m.width - 6
+		if w < minContentWidth {
+			w = minContentWidth
+		}
+		if w > maxContentWidth {
+			w = maxContentWidth
+		}
 	}
 	m.contentWidth = w
 
@@ -806,7 +856,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
+		if m.fixedWidth <= 0 {
+			m.width = msg.Width
+		}
 		if m.fixedHeight <= 0 {
 			m.height = msg.Height
 		}
@@ -839,6 +891,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.isTyping() {
 				return m, tea.Quit
 			}
+		}
+
+		// Global helper hide/show toggle. Excluded from stateMenu, where "h"
+		// already runs History - and from any text input, same as "q" above.
+		// Deliberately not listed among the key hints itself.
+		if msg.String() == "h" && !m.isTyping() && m.state != stateMenu {
+			m.helpHidden = !m.helpHidden
+			m.config.UIHelpHidden = m.helpHidden
+			_ = m.config.Save()
+			return m, nil
 		}
 
 		if (msg.String() == "tab" || msg.String() == "shift+tab") && m.canSwitchTab() {
@@ -1523,7 +1585,7 @@ func (m *Model) renderSearchBox() string {
 	case m.searchQuery != "":
 		return hintStyle.Render("search: ") + keyStyle.Render(m.searchQuery) + hintStyle.Render("  (esc clear)")
 	default:
-		return hintLine(keyHint{"s", "search"})
+		return m.hint(keyHint{"s", "search"})
 	}
 }
 
@@ -1537,15 +1599,15 @@ func (m *Model) View() string {
 			doc += errorStyle.Render(fmt.Sprintf("  Error: %v", m.err)) + "\n\n"
 		}
 		if len(m.releaseList.Items()) == 0 {
-			doc += "  " + hintLine(keyHint{"a", "add a new release profile"}, keyHint{"tab", "switch tab"})
+			doc += "  " + m.hint(keyHint{"a", "add a new release profile"}, keyHint{"tab", "switch tab"})
 		} else if m.isEditing {
-			doc += "  " + hintStyle.Render("Editing... ") + hintLine(
+			doc += "  " + hintStyle.Render("Editing... ") + m.hint(
 				keyHint{"tab", "switch field"},
 				keyHint{"enter", "save"},
 				keyHint{"esc", "cancel"},
 			)
 		} else {
-			doc += "  " + hintLine(
+			doc += "  " + m.hint(
 				keyHint{"enter", "select"},
 				keyHint{"a", "add profile"},
 				keyHint{"e", "edit"},
@@ -1566,15 +1628,15 @@ func (m *Model) View() string {
 		}
 		releases := m.config.GetReleasesForContext(m.currentContext)
 		if len(releases) == 0 {
-			s += "  " + hintLine(keyHint{"a", "add a new release profile"}, keyHint{"tab", "switch tab"})
+			s += "  " + m.hint(keyHint{"a", "add a new release profile"}, keyHint{"tab", "switch tab"})
 		} else if m.isEditing {
-			s += "  " + hintStyle.Render("Editing... ") + hintLine(
+			s += "  " + hintStyle.Render("Editing... ") + m.hint(
 				keyHint{"tab", "switch field"},
 				keyHint{"enter", "save"},
 				keyHint{"esc", "cancel"},
 			)
 		} else {
-			s += "  " + hintLine(
+			s += "  " + m.hint(
 				keyHint{"enter", "select"},
 				keyHint{"a", "add profile"},
 				keyHint{"e", "edit"},
@@ -1601,16 +1663,19 @@ func (m *Model) View() string {
 				s += fmt.Sprintf("%s %s: %s\n", cursor, label, input.View())
 			}
 		}
-		s += "\n" + hintLine(keyHint{"tab", "switch field"}, keyHint{"enter", "save"}, keyHint{"esc", "cancel"})
+		s += "\n" + m.hint(keyHint{"tab", "switch field"}, keyHint{"enter", "save"}, keyHint{"esc", "cancel"})
 	case stateMenu:
 		s += fmt.Sprintf("Selected: %s\n\n", m.selected.ReleaseName)
 		if m.isEditing {
-			s += hintStyle.Render("Editing... ") + hintLine(
+			s += hintStyle.Render("Editing... ") + m.hint(
 				keyHint{"tab", "switch field"},
 				keyHint{"enter", "save"},
 				keyHint{"esc", "cancel"},
 			)
 		} else {
+			// The action menu itself (not just a footer hint) - always
+			// shown regardless of the helper toggle, since it's the only
+			// way to see what a selected release can be acted on with.
 			s += hintLines(
 				keyHint{"h", "History"},
 				keyHint{"u", "Upgrade"},
@@ -1625,18 +1690,18 @@ func (m *Model) View() string {
 				menuHints = append(menuHints, keyHint{"[ ]", "switch context"})
 			}
 			menuHints = append(menuHints, keyHint{"tab", "switch tab"}, keyHint{"esc", "back"})
-			s += "\n\n" + hintLine(menuHints...)
+			s += "\n\n" + m.hint(menuHints...)
 		}
 	case stateConfirmAction:
 		s += fmt.Sprintf("Confirmation\n\n%s\n\n", m.confirmMsg)
 		if m.confirmDryRunAction != nil {
-			s += hintLine(keyHint{"y", "yes"}, keyHint{"d", "dry run"}, keyHint{"n", "no"}, keyHint{"esc", "cancel"})
+			s += m.hint(keyHint{"y", "yes"}, keyHint{"d", "dry run"}, keyHint{"n", "no"}, keyHint{"esc", "cancel"})
 		} else {
-			s += hintLine(keyHint{"y", "yes"}, keyHint{"n", "no"}, keyHint{"esc", "cancel"})
+			s += m.hint(keyHint{"y", "yes"}, keyHint{"n", "no"}, keyHint{"esc", "cancel"})
 		}
 	case stateRollbackInput:
 		s += fmt.Sprintf("Rollback %s\n\n%s\n\n", m.selected.ReleaseName, m.rollbackInput.View())
-		s += hintLine(keyHint{"enter", "execute"}, keyHint{"esc", "cancel"})
+		s += m.hint(keyHint{"enter", "execute"}, keyHint{"esc", "cancel"})
 	case stateAddProfile:
 		s += "Add New Release Profile\n\n"
 		for i, input := range m.inputs {
@@ -1646,7 +1711,7 @@ func (m *Model) View() string {
 			}
 			s += fmt.Sprintf("%s %s\n", cursor, input.View())
 		}
-		s += "\n" + hintLine(keyHint{"tab", "next field"}, keyHint{"enter", "save"}, keyHint{"esc", "cancel"})
+		s += "\n" + m.hint(keyHint{"tab", "next field"}, keyHint{"enter", "save"}, keyHint{"esc", "cancel"})
 	case stateEditProfile:
 		s += fmt.Sprintf("Edit Release Profile [%s]\n\n", m.selected.ReleaseName)
 		for i, input := range m.inputs {
@@ -1656,7 +1721,7 @@ func (m *Model) View() string {
 			}
 			s += fmt.Sprintf("%s %s\n", cursor, input.View())
 		}
-		s += "\n" + hintLine(keyHint{"tab", "next field"}, keyHint{"enter", "save"}, keyHint{"esc", "cancel"})
+		s += "\n" + m.hint(keyHint{"tab", "next field"}, keyHint{"enter", "save"}, keyHint{"esc", "cancel"})
 	case stateExecute:
 		if m.loading {
 			s += fmt.Sprintf("%s %s", m.spinner.View(), m.loadingLabel)
@@ -1666,7 +1731,7 @@ func (m *Model) View() string {
 				s += m.lastCommand + "\n\n"
 			}
 			s += m.output + "\n\n"
-			s += hintLine(keyHint{"esc", "return to menu"})
+			s += m.hint(keyHint{"esc", "return to menu"})
 		}
 	default:
 		s += fmt.Sprintf("Unknown state: %d", m.state)

@@ -17,9 +17,10 @@ func main() {
 		flag.PrintDefaults()
 	}
 	height := flag.Int("height", 0, "number of release rows to show (1 row = 1 release), clamped to 10-50, instead of following the terminal size; saved as the default for future runs")
+	width := flag.Int("width", 0, "table/list content width in columns, clamped to 60-120, instead of following the terminal size; saved as the default for future runs")
 	flag.Parse()
 
-	m, err := tui.NewModel(*height)
+	m, err := tui.NewModel(*height, *width)
 	if err != nil {
 		fmt.Printf("Error initializing model: %v\n", err)
 		os.Exit(1)
