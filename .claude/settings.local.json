@@ -8,6 +8,9 @@
       "Bash(helm plugin *)",
       "Bash(echo \"exit=$?\")",
       "Bash(helm env *)"
+    ],
+    "additionalDirectories": [
+      "/home/deukyun/Desktop/helm-tui"
     ]
   }
 }

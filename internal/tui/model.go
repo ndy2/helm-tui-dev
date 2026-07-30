@@ -9,10 +9,13 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
+
 	"github.com/deukyun/helm-tui/internal/config"
 	"github.com/deukyun/helm-tui/internal/helm"
 	"github.com/deukyun/helm-tui/internal/kube"
@@ -21,10 +24,39 @@ import (
 )
 
 var docStyle = lipgloss.NewStyle().Margin(1, 2)
-var headerStyle = lipgloss.NewStyle().Foreground(styles.HighlightColor).Bold(true)
+var errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 var selectedStyle = lipgloss.NewStyle().Foreground(styles.HighlightColor).Bold(true)
 var normalStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 var cursorStyle = lipgloss.NewStyle().Background(styles.HighlightColor).Foreground(lipgloss.Color("252"))
+
+// keyStyle highlights a key name; hintStyle is the muted gray used for the
+// action it performs, so key hint lines read as "key  action" without
+// needing quotes around the key.
+var keyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("255")).Bold(true)
+var hintStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+
+type keyHint struct {
+	key   string
+	label string
+}
+
+// hintLine renders key hints on a single line, separated by a muted " • ".
+func hintLine(hints ...keyHint) string {
+	parts := make([]string, len(hints))
+	for i, h := range hints {
+		parts[i] = keyStyle.Render(h.key) + hintStyle.Render(" "+h.label)
+	}
+	return strings.Join(parts, hintStyle.Render(" • "))
+}
+
+// hintLines renders key hints one per line, for vertical menus.
+func hintLines(hints ...keyHint) string {
+	lines := make([]string, len(hints))
+	for i, h := range hints {
+		lines[i] = keyStyle.Render(h.key) + hintStyle.Render("  "+h.label)
+	}
+	return strings.Join(lines, "\n")
+}
 
 type sessionState int
 
@@ -40,6 +72,35 @@ const (
 	stateInlineEdit
 )
 
+const (
+	// minContentWidth/minListHeight keep the table and list usable even if
+	// the terminal is resized very small. maxContentWidth keeps it from
+	// stretching into an unreadably wide table on a very wide terminal.
+	minContentWidth = 60
+	maxContentWidth = 120
+	minListHeight   = 3
+	maxListHeight   = 10
+	// chromeHeight is everything drawn around the list rows (margin, the
+	// context line, the table's own borders/header/divider, and breathing
+	// room for the panel below the table). It's an estimate, not exact,
+	// since the bottom panel's height varies by state.
+	chromeHeight = 13
+)
+
+// helmResultMsg carries the result of a helm CLI call run in the
+// background via a tea.Cmd (see startHelmCmd).
+type helmResultMsg struct {
+	output string
+	err    error
+}
+
+func helmCmd(fn func() (string, error)) tea.Cmd {
+	return func() tea.Msg {
+		out, err := fn()
+		return helmResultMsg{output: out, err: err}
+	}
+}
+
 type Model struct {
 	state          sessionState
 	config         *config.Config
@@ -49,7 +110,8 @@ type Model struct {
 	selected       config.ReleaseProfile
 	err            error
 
-	currentContext string
+	currentContext    string
+	availableContexts []string
 
 	// Inline editing state
 	isEditing    bool
@@ -66,8 +128,17 @@ type Model struct {
 	rollbackInput textinput.Model
 
 	// For command execution
-	helmClient *helm.Client
-	output     string
+	helmClient   *helm.Client
+	output       string
+	loading      bool
+	loadingLabel string
+	spinner      spinner.Model
+
+	// Window size, applied to the table/list on resize (see applyWindowSize).
+	width        int
+	height       int
+	contentWidth int
+	tableCols    []components.ColumnDefinition
 }
 
 type releaseItem struct {
@@ -131,6 +202,10 @@ func (d releaseDelegate) Render(w io.Writer, m list.Model, index int, item list.
 	// Use the same column widths the header uses (see components.SetTable)
 	// so row cells line up under the header cells. The cursor prefix eats
 	// into the first column's width, same as the header's first column.
+	// Fields are truncated to their column width (same as the table
+	// header's own cells) so a long value can't push later columns out of
+	// alignment or wrap the row onto an extra line, especially in a
+	// narrow terminal.
 	cols := d.model.table.Columns()
 	var b strings.Builder
 	b.WriteString(cursor)
@@ -142,7 +217,13 @@ func (d releaseDelegate) Render(w io.Writer, m list.Model, index int, item list.
 		if idx == 0 {
 			width = max(width-2, 0)
 		}
-		fmt.Fprintf(&b, "%-*s", width, field)
+		// Reserve a 1-char gap so a fully-truncated value doesn't run
+		// straight into the next column; the last column doesn't need it.
+		truncWidth := width
+		if idx < len(fields)-1 {
+			truncWidth = max(width-1, 0)
+		}
+		fmt.Fprintf(&b, "%-*s", width, runewidth.Truncate(field, truncWidth, "…"))
 	}
 
 	fmt.Fprintf(w, "%s", rowStyle.Render(b.String()))
@@ -159,29 +240,57 @@ func NewModel() (*Model, error) {
 		ctx = "unknown"
 	}
 
+	availableContexts, err := kube.ListContexts()
+	if err != nil || len(availableContexts) == 0 {
+		// kubectl isn't usable (not installed, no kubeconfig, etc.) - fall
+		// back to just the one context so '['/']' become a no-op instead
+		// of erroring.
+		availableContexts = []string{ctx}
+	}
+
+	sp := spinner.New()
+	sp.Spinner = spinner.Dot
+	sp.Style = lipgloss.NewStyle().Foreground(styles.HighlightColor)
+
 	// Create model first so we can pass it to delegate
 	m := &Model{
-		state:          stateList,
-		config:         cfg,
-		currentContext: ctx,
-		helmClient:     helm.NewClient(),
+		state:             stateList,
+		config:            cfg,
+		currentContext:    ctx,
+		availableContexts: availableContexts,
+		helmClient:        helm.NewClient(),
+		spinner:           sp,
+		// Sane defaults until the first tea.WindowSizeMsg arrives.
+		width:  120,
+		height: 30,
 	}
 
 	// Initialize Table
 	m.table = components.GenerateTable()
-	cols := []components.ColumnDefinition{
+	m.tableCols = []components.ColumnDefinition{
 		{Title: "RELEASE", Width: 20},
 		{Title: "NAMESPACE", Width: 15},
 		{Title: "CHART", FlexFactor: 3},
 		{Title: "CHART VER", Width: 12},
 		{Title: "APP VERSION", FlexFactor: 2},
 	}
-	components.SetTable(&m.table, cols, 120)
 
-	var items []list.Item
-	releases := cfg.GetReleasesForContext(ctx)
+	l := list.New(m.sortedListItems(ctx), releaseDelegate{model: m}, 0, 0)
+	l.SetShowTitle(false) // the releases table header already shows this
+	l.SetShowStatusBar(false)
+	l.SetFilteringEnabled(false)
+	l.SetShowHelp(false)
+	m.list = l
 
-	// Sort: LastSelected (Desc) -> ReleaseName (Asc)
+	m.applyWindowSize()
+
+	return m, nil
+}
+
+// sortedListItems returns the release items for ctx sorted by LastSelected
+// (desc) then ReleaseName (asc).
+func (m *Model) sortedListItems(ctx string) []list.Item {
+	releases := m.config.GetReleasesForContext(ctx)
 	sort.Slice(releases, func(i, j int) bool {
 		if releases[i].LastSelected != releases[j].LastSelected {
 			return releases[i].LastSelected > releases[j].LastSelected
@@ -189,19 +298,79 @@ func NewModel() (*Model, error) {
 		return releases[i].ReleaseName < releases[j].ReleaseName
 	})
 
+	items := make([]list.Item, 0, len(releases))
 	for _, r := range releases {
 		items = append(items, releaseItem{profile: r})
 	}
+	return items
+}
 
-	// Set height to 10 to show up to 10 items at once
-	l := list.New(items, releaseDelegate{model: m}, 0, 10)
-	l.Title = fmt.Sprintf("Releases [%s]", ctx)
-	l.SetShowStatusBar(false)
-	l.SetFilteringEnabled(false)
-	l.SetShowHelp(false)
-	m.list = l
+// switchContext moves the current kubernetes context by delta (+1/-1)
+// within availableContexts, applies it via kubectl so it also takes effect
+// outside the TUI, and reloads the release list for the new context.
+func (m *Model) switchContext(delta int) {
+	n := len(m.availableContexts)
+	if n <= 1 {
+		return
+	}
 
-	return m, nil
+	idx := 0
+	for i, c := range m.availableContexts {
+		if c == m.currentContext {
+			idx = i
+			break
+		}
+	}
+	idx = ((idx+delta)%n + n) % n
+	newCtx := m.availableContexts[idx]
+
+	if err := kube.UseContext(newCtx); err != nil {
+		m.err = err
+		return
+	}
+
+	m.err = nil
+	m.currentContext = newCtx
+	m.list.SetItems(m.sortedListItems(newCtx))
+}
+
+// applyWindowSize recomputes the table's column widths and the list's
+// height from the model's current width/height, clamped to a usable
+// range. Called on startup and on every tea.WindowSizeMsg.
+func (m *Model) applyWindowSize() {
+	// docStyle's outer margin (2 cols each side) plus the table's own
+	// left/right border (1 col each side) sit outside the content width.
+	w := m.width - 6
+	if w < minContentWidth {
+		w = minContentWidth
+	}
+	if w > maxContentWidth {
+		w = maxContentWidth
+	}
+	m.contentWidth = w
+
+	if len(m.tableCols) > 0 {
+		components.SetTable(&m.table, m.tableCols, w)
+	}
+
+	listHeight := m.height - chromeHeight
+	if listHeight < minListHeight {
+		listHeight = minListHeight
+	}
+	if listHeight > maxListHeight {
+		listHeight = maxListHeight
+	}
+	m.list.SetSize(w, listHeight)
+}
+
+// startHelmCmd switches to the execute view, shows a spinner with the given
+// label, and runs fn on a background goroutine (via tea.Cmd) so the UI never
+// blocks on a helm CLI call. The result comes back as a helmResultMsg.
+func (m *Model) startHelmCmd(label string, fn func() (string, error)) tea.Cmd {
+	m.state = stateExecute
+	m.loading = true
+	m.loadingLabel = label
+	return tea.Batch(helmCmd(fn), m.spinner.Tick)
 }
 
 func (m *Model) Init() tea.Cmd {
@@ -212,6 +381,27 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.applyWindowSize()
+		return m, nil
+	case helmResultMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.output = fmt.Sprintf("Error: %v\n\n%s", msg.err, msg.output)
+		} else {
+			m.output = msg.output
+		}
+		m.state = stateExecute
+		return m, nil
+	case spinner.TickMsg:
+		if !m.loading {
+			return m, nil
+		}
+		var spinCmd tea.Cmd
+		m.spinner, spinCmd = m.spinner.Update(msg)
+		return m, spinCmd
 	case tea.KeyMsg:
 		// Handle global keys first
 		switch msg.String() {
@@ -329,6 +519,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected = selectedItem.profile
 				return m, nil
 			}
+			if msg.String() == "[" {
+				m.switchContext(-1)
+				return m, nil
+			}
+			if msg.String() == "]" {
+				m.switchContext(1)
+				return m, nil
+			}
 			if msg.String() == "a" {
 				m.setupAddProfileForm()
 				m.state = stateAddProfile
@@ -353,16 +551,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				selectedItem := m.list.SelectedItem().(releaseItem)
 				m.selected = selectedItem.profile
 
-				var output string
-				var err error
-				output, err = m.helmClient.Upgrade(m.selected)
-				if err != nil {
-					m.output = fmt.Sprintf("Error: %v\n\n%s", err, output)
-				} else {
-					m.output = output
-				}
-				m.state = stateExecute
-				return m, nil
+				profile := m.selected
+				return m, m.startHelmCmd(fmt.Sprintf("Upgrading %s...", profile.ReleaseName), func() (string, error) {
+					return m.helmClient.Upgrade(profile)
+				})
 			}
 			return m, listCmd
 		} else if m.state == stateMenu {
@@ -403,16 +595,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			var output string
-			var err error
+			profile := m.selected
 
 			switch msg.String() {
 			case "h":
-				output, err = m.helmClient.History(m.selected)
+				return m, m.startHelmCmd(fmt.Sprintf("Fetching history for %s...", profile.ReleaseName), func() (string, error) {
+					return m.helmClient.History(profile)
+				})
 			case "u":
-				output, err = m.helmClient.Upgrade(m.selected)
+				return m, m.startHelmCmd(fmt.Sprintf("Upgrading %s...", profile.ReleaseName), func() (string, error) {
+					return m.helmClient.Upgrade(profile)
+				})
 			case "i":
-				output, err = m.helmClient.Install(m.selected)
+				return m, m.startHelmCmd(fmt.Sprintf("Installing %s...", profile.ReleaseName), func() (string, error) {
+					return m.helmClient.Install(profile)
+				})
 			case "r":
 				m.rollbackInput = textinput.New()
 				m.rollbackInput.Placeholder = "Revision (Enter for previous)"
@@ -420,34 +617,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateRollbackInput
 				return m, nil
 			case "d":
-				m.confirmMsg = fmt.Sprintf("Are you sure you want to delete release %s?", m.selected.ReleaseName)
+				m.confirmMsg = fmt.Sprintf("Are you sure you want to delete release %s?", profile.ReleaseName)
 				m.confirmAction = func() tea.Cmd {
-					var out string
-					var e error
-					out, e = m.helmClient.Delete(m.selected)
-					if e != nil {
-						m.output = fmt.Sprintf("Error: %v\n\n%s", e, out)
-						m.state = stateExecute
-						return nil
-					}
-					m.output = out
-					m.state = stateExecute
-					return nil
+					return m.startHelmCmd(fmt.Sprintf("Deleting %s...", profile.ReleaseName), func() (string, error) {
+						return m.helmClient.Delete(profile)
+					})
 				}
 				m.state = stateConfirmAction
 				return m, nil
 			default:
 				return m, nil
 			}
-
-			if err != nil {
-				m.output = fmt.Sprintf("Error: %v\n\n%s", err, output)
-			} else {
-				m.output = output
-			}
-			m.state = stateExecute
-			return m, nil
 		} else if m.state == stateExecute {
+			if m.loading {
+				return m, nil
+			}
 			if msg.String() == "esc" {
 				m.state = stateMenu
 				return m, nil
@@ -471,16 +655,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.rollbackInput.Value() != "" {
 					fmt.Sscanf(m.rollbackInput.Value(), "%d", &rev)
 				}
-				var output string
-				var err error
-				output, err = m.helmClient.Rollback(m.selected, rev)
-				if err != nil {
-					m.output = fmt.Sprintf("Error: %v\n\n%s", err, output)
-				} else {
-					m.output = output
-				}
-				m.state = stateExecute
-				return m, nil
+				profile := m.selected
+				return m, m.startHelmCmd(fmt.Sprintf("Rolling back %s...", profile.ReleaseName), func() (string, error) {
+					return m.helmClient.Rollback(profile, rev)
+				})
 			}
 			var cmd tea.Cmd
 			m.rollbackInput, cmd = m.rollbackInput.Update(msg)
@@ -647,36 +825,51 @@ func (m *Model) setupEditProfileForm() {
 	m.focus = 0
 }
 
+// renderReleasesTable renders the releases table (its title already shows
+// the current context). It is shown in every state so the table stays
+// visible while the user navigates the release menu, executes commands, or
+// fills out forms.
+func (m *Model) renderReleasesTable() string {
+	s := components.RenderTable(m.table, 15, m.contentWidth, fmt.Sprintf(" Releases [%s]", m.currentContext)) + "\n"
+
+	listView := m.list.View()
+	borderStyle := lipgloss.NewStyle().
+		Border(styles.Border, false, true, true).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(0, 1).
+		Width(m.contentWidth)
+
+	s += borderStyle.Render(listView)
+	return s
+}
+
 func (m *Model) View() string {
-	var s string
+	s := m.renderReleasesTable() + "\n\n"
+
 	switch m.state {
 	case stateList:
-		s = headerStyle.Render(fmt.Sprintf("Current Context: %s", m.currentContext)) + "\n\n"
-
-		// Use the new Table component for rendering the list
-		s += components.RenderTable(m.table, 15, 120, fmt.Sprintf(" Releases [%s]", m.currentContext)) + "\n"
-
-		listView := m.list.View()
-		borderStyle := lipgloss.NewStyle().
-			Border(styles.Border, false, true, true).
-			BorderForeground(lipgloss.Color("240")).
-			Padding(0, 1).
-			Width(120)
-
-		s += borderStyle.Render(listView)
-
+		if m.err != nil {
+			s += errorStyle.Render(fmt.Sprintf("  Error: %v", m.err)) + "\n\n"
+		}
 		releases := m.config.GetReleasesForContext(m.currentContext)
 		if len(releases) == 0 {
-			s += "\n\n  Press 'a' to add a new release profile"
+			s += "  " + hintLine(keyHint{"a", "add a new release profile"})
+		} else if m.isEditing {
+			s += "  " + hintStyle.Render("Editing... ") + hintLine(
+				keyHint{"tab", "switch field"},
+				keyHint{"enter", "save"},
+				keyHint{"esc", "cancel"},
+			)
 		} else {
-			if m.isEditing {
-				s += "\n\n  Editing... 'tab' switch field • 'enter' save • 'esc' cancel"
-			} else {
-				s += "\n\n  'a' add profile • 'e' edit profile • 'u' upgrade • 'enter' select release"
-			}
+			s += "  " + hintLine(
+				keyHint{"a", "add profile"},
+				keyHint{"e", "edit profile"},
+				keyHint{"u", "upgrade"},
+				keyHint{"enter", "select release"},
+			)
 		}
 	case stateInlineEdit:
-		s = fmt.Sprintf("Quick Edit: %s\n\n", m.selected.ReleaseName)
+		s += fmt.Sprintf("Quick Edit: %s\n\n", m.selected.ReleaseName)
 		if len(m.inputs) == 0 {
 			s += "Error: No inputs initialized"
 		} else {
@@ -692,15 +885,27 @@ func (m *Model) View() string {
 				s += fmt.Sprintf("%s %s: %s\n", cursor, label, input.View())
 			}
 		}
-		s += "\nTab: Switch Field | Enter: Save | Esc: Cancel"
+		s += "\n" + hintLine(keyHint{"tab", "switch field"}, keyHint{"enter", "save"}, keyHint{"esc", "cancel"})
 	case stateMenu:
-		s = fmt.Sprintf("Selected: %s\n\n(h) History\n(u) Upgrade\n(i) Install\n(r) Rollback\n(d) Delete\n(e) Edit Profile\n(x) Delete Profile\n\nEsc: Back", m.selected.ReleaseName)
+		s += fmt.Sprintf("Selected: %s\n\n", m.selected.ReleaseName)
+		s += hintLines(
+			keyHint{"h", "History"},
+			keyHint{"u", "Upgrade"},
+			keyHint{"i", "Install"},
+			keyHint{"r", "Rollback"},
+			keyHint{"d", "Delete"},
+			keyHint{"e", "Edit Profile"},
+			keyHint{"x", "Delete Profile"},
+		)
+		s += "\n\n" + hintLine(keyHint{"esc", "back"})
 	case stateConfirmAction:
-		s = fmt.Sprintf("Confirmation\n\n%s\n\n(y) Yes | (n) No / Esc: Cancel", m.confirmMsg)
+		s += fmt.Sprintf("Confirmation\n\n%s\n\n", m.confirmMsg)
+		s += hintLine(keyHint{"y", "yes"}, keyHint{"n", "no"}, keyHint{"esc", "cancel"})
 	case stateRollbackInput:
-		s = fmt.Sprintf("Rollback %s\n\n%s\n\nEnter: Execute | Esc: Cancel", m.selected.ReleaseName, m.rollbackInput.View())
+		s += fmt.Sprintf("Rollback %s\n\n%s\n\n", m.selected.ReleaseName, m.rollbackInput.View())
+		s += hintLine(keyHint{"enter", "execute"}, keyHint{"esc", "cancel"})
 	case stateAddProfile:
-		s = fmt.Sprintf("Add New Release Profile [%s]\n\n", m.currentContext)
+		s += fmt.Sprintf("Add New Release Profile [%s]\n\n", m.currentContext)
 		for i, input := range m.inputs {
 			cursor := "  "
 			if i == m.focus {
@@ -708,9 +913,9 @@ func (m *Model) View() string {
 			}
 			s += fmt.Sprintf("%s %s\n", cursor, input.View())
 		}
-		s += "\nTab: Next Field | Enter: Save | Esc: Cancel"
+		s += "\n" + hintLine(keyHint{"tab", "next field"}, keyHint{"enter", "save"}, keyHint{"esc", "cancel"})
 	case stateEditProfile:
-		s = fmt.Sprintf("Edit Release Profile [%s]\n\n", m.selected.ReleaseName)
+		s += fmt.Sprintf("Edit Release Profile [%s]\n\n", m.selected.ReleaseName)
 		for i, input := range m.inputs {
 			cursor := "  "
 			if i == m.focus {
@@ -718,11 +923,16 @@ func (m *Model) View() string {
 			}
 			s += fmt.Sprintf("%s %s\n", cursor, input.View())
 		}
-		s += "\nTab: Next Field | Enter: Save | Esc: Cancel"
+		s += "\n" + hintLine(keyHint{"tab", "next field"}, keyHint{"enter", "save"}, keyHint{"esc", "cancel"})
 	case stateExecute:
-		s = fmt.Sprintf("Execution Result for %s:\n\n%s\n\nPress 'esc' to return to menu", m.selected.ReleaseName, m.output)
+		if m.loading {
+			s += fmt.Sprintf("%s %s", m.spinner.View(), m.loadingLabel)
+		} else {
+			s += fmt.Sprintf("Execution Result for %s:\n\n%s\n\n", m.selected.ReleaseName, m.output)
+			s += hintLine(keyHint{"esc", "return to menu"})
+		}
 	default:
-		s = fmt.Sprintf("Unknown state: %d", m.state)
+		s += fmt.Sprintf("Unknown state: %d", m.state)
 	}
 	return docStyle.Render(s)
 }
