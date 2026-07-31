@@ -14,7 +14,7 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mattn/go-runewidth"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/deukyun/helm-tui/internal/config"
 	"github.com/deukyun/helm-tui/internal/helm"
@@ -28,6 +28,7 @@ var errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true
 var selectedStyle = lipgloss.NewStyle().Foreground(styles.HighlightColor).Bold(true)
 var normalStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 var cursorStyle = lipgloss.NewStyle().Background(styles.HighlightColor).Foreground(lipgloss.Color("252"))
+var noticeStyle = lipgloss.NewStyle().Foreground(styles.HighlightColor)
 
 // keyStyle highlights a key name; hintStyle is the muted gray used for the
 // action it performs, so key hint lines read as "key  action" without
@@ -133,6 +134,24 @@ func helmCmd(fn func() (string, error)) tea.Cmd {
 	}
 }
 
+// browserOpenedMsg reports that a running helm command's auth-prompt
+// watcher opened the user's browser for an SSO login (see
+// waitForBrowserOpened).
+type browserOpenedMsg struct {
+	url string
+}
+
+// waitForBrowserOpened blocks on client's browser-opened channel and is
+// re-issued after every message (see the browserOpenedMsg case in Update),
+// so exactly one listener goroutine stays alive for the process lifetime
+// instead of one per helm command.
+func waitForBrowserOpened(client *helm.Client) tea.Cmd {
+	return func() tea.Msg {
+		url := <-client.BrowserOpened()
+		return browserOpenedMsg{url: url}
+	}
+}
+
 type Model struct {
 	state          sessionState
 	config         *config.Config
@@ -175,12 +194,14 @@ type Model struct {
 	rollbackInput        textinput.Model
 
 	// For command execution
-	helmClient   *helm.Client
-	output       string
-	lastCommand  string // the "helm ..." line the last startHelmCmd ran, shown with the result
-	loading      bool
-	loadingLabel string
-	spinner      spinner.Model
+	helmClient       *helm.Client
+	output           string
+	lastCommand      string // the "helm ..." line the last startHelmCmd ran, shown with the result
+	loading          bool
+	loadingLabel     string
+	cancelling       bool   // esc was pressed while loading; Cancel() was sent, awaiting helmResultMsg
+	browserOpenedURL string // set when the current command's auth watcher opened the browser for SSO login
+	spinner          spinner.Model
 
 	// helpHidden hides all key hints (see the global "h" toggle in Update).
 	// Persisted via config.Config.UIHelpHidden so it carries over runs.
@@ -261,7 +282,17 @@ func renderRow(cols []table.Column, selected bool, fields []string) string {
 		if idx < len(fields)-1 {
 			truncWidth = max(width-1, 0)
 		}
-		fmt.Fprintf(&b, "%-*s", width, runewidth.Truncate(field, truncWidth, "…"))
+		// ansi.Truncate/StringWidth (rather than a plain rune-count-based
+		// truncate/pad) are required here: a quick-edit field's value can
+		// carry the textinput cursor's ANSI styling mid-string (see
+		// releaseDelegate.Render), and naively measuring/cutting that by
+		// rune count miscounts the invisible escape bytes as visible width,
+		// corrupting the cut and bleeding style into the next column.
+		truncated := ansi.Truncate(field, truncWidth, "…")
+		b.WriteString(truncated)
+		if pad := width - ansi.StringWidth(truncated); pad > 0 {
+			b.WriteString(strings.Repeat(" ", pad))
+		}
 	}
 
 	rowStyle := normalStyle
@@ -803,6 +834,8 @@ func (m *Model) startHelmCmd(label, command string, fn func() (string, error)) t
 	m.loading = true
 	m.loadingLabel = label
 	m.lastCommand = command
+	m.cancelling = false
+	m.browserOpenedURL = ""
 	return tea.Batch(helmCmd(fn), m.spinner.Tick)
 }
 
@@ -812,8 +845,8 @@ func (m *Model) startHelmCmd(label, command string, fn func() (string, error)) t
 // where "n"/esc returns to. "d" runs the same command with --dry-run
 // instead, without leaving the confirmation's safety net.
 func (m *Model) confirmUpgrade(profile config.ReleaseProfile, cancelState sessionState) {
-	cmdStr := helm.MultilineCommandString(helm.UpgradeArgs(profile, false))
-	dryCmdStr := helm.MultilineCommandString(helm.UpgradeArgs(profile, true))
+	cmdStr := helm.MultilineCommandString(helm.UpgradeArgs(profile, false), m.contentWidth)
+	dryCmdStr := helm.MultilineCommandString(helm.UpgradeArgs(profile, true), m.contentWidth)
 	m.confirmMsg = fmt.Sprintf("Run this command?\n\n%s", cmdStr)
 	m.confirmCancelState = cancelState
 	m.confirmAction = func() tea.Cmd {
@@ -830,8 +863,8 @@ func (m *Model) confirmUpgrade(profile config.ReleaseProfile, cancelState sessio
 }
 
 func (m *Model) confirmInstall(profile config.ReleaseProfile, cancelState sessionState) {
-	cmdStr := helm.MultilineCommandString(helm.InstallArgs(profile, false))
-	dryCmdStr := helm.MultilineCommandString(helm.InstallArgs(profile, true))
+	cmdStr := helm.MultilineCommandString(helm.InstallArgs(profile, false), m.contentWidth)
+	dryCmdStr := helm.MultilineCommandString(helm.InstallArgs(profile, true), m.contentWidth)
 	m.confirmMsg = fmt.Sprintf("Run this command?\n\n%s", cmdStr)
 	m.confirmCancelState = cancelState
 	m.confirmAction = func() tea.Cmd {
@@ -848,7 +881,7 @@ func (m *Model) confirmInstall(profile config.ReleaseProfile, cancelState sessio
 }
 
 func (m *Model) Init() tea.Cmd {
-	return nil
+	return waitForBrowserOpened(m.helmClient)
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -866,6 +899,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case helmResultMsg:
 		m.loading = false
+		m.cancelling = false
 		if msg.err != nil {
 			m.output = fmt.Sprintf("Error: %v\n\n%s", msg.err, msg.output)
 		} else {
@@ -873,6 +907,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.state = stateExecute
 		return m, nil
+	case browserOpenedMsg:
+		m.browserOpenedURL = msg.url
+		return m, waitForBrowserOpened(m.helmClient)
 	case spinner.TickMsg:
 		if !m.loading {
 			return m, nil
@@ -1289,7 +1326,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			switch msg.String() {
 			case "h":
-				cmdStr := helm.MultilineCommandString(helm.HistoryArgs(profile))
+				cmdStr := helm.MultilineCommandString(helm.HistoryArgs(profile), m.contentWidth)
 				return m, m.startHelmCmd(fmt.Sprintf("Fetching history for %s...", profile.ReleaseName), cmdStr, func() (string, error) {
 					return m.helmClient.History(profile)
 				})
@@ -1306,7 +1343,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateRollbackInput
 				return m, nil
 			case "d":
-				deleteCmdStr := helm.MultilineCommandString(helm.DeleteArgs(profile))
+				deleteCmdStr := helm.MultilineCommandString(helm.DeleteArgs(profile), m.contentWidth)
 				m.confirmMsg = fmt.Sprintf("Are you sure you want to delete release %s?\n\n%s", profile.ReleaseName, deleteCmdStr)
 				m.confirmCancelState = stateMenu
 				m.confirmDryRunAction = nil
@@ -1322,6 +1359,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		} else if m.state == stateExecute {
 			if m.loading {
+				if msg.String() == "esc" && !m.cancelling {
+					m.cancelling = true
+					m.helmClient.Cancel()
+				}
 				return m, nil
 			}
 			if msg.String() == "esc" {
@@ -1352,7 +1393,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					fmt.Sscanf(m.rollbackInput.Value(), "%d", &rev)
 				}
 				profile := m.selected
-				cmdStr := helm.MultilineCommandString(helm.RollbackArgs(profile, rev))
+				cmdStr := helm.MultilineCommandString(helm.RollbackArgs(profile, rev), m.contentWidth)
 				return m, m.startHelmCmd(fmt.Sprintf("Rolling back %s...", profile.ReleaseName), cmdStr, func() (string, error) {
 					return m.helmClient.Rollback(profile, rev)
 				})
@@ -1724,13 +1765,21 @@ func (m *Model) View() string {
 		s += "\n" + m.hint(keyHint{"tab", "next field"}, keyHint{"enter", "save"}, keyHint{"esc", "cancel"})
 	case stateExecute:
 		if m.loading {
-			s += fmt.Sprintf("%s %s", m.spinner.View(), m.loadingLabel)
+			label := m.loadingLabel
+			if m.cancelling {
+				label += " (cancelling...)"
+			}
+			s += fmt.Sprintf("%s %s", m.spinner.View(), label)
+			if m.browserOpenedURL != "" {
+				s += "\n\n" + noticeStyle.Render(fmt.Sprintf("Opened your browser for SSO login:\n%s", m.browserOpenedURL))
+			}
+			s += "\n\n" + m.hint(keyHint{"esc", "cancel"})
 		} else {
 			s += fmt.Sprintf("Execution Result for %s:\n\n", m.selected.ReleaseName)
 			if m.lastCommand != "" {
 				s += m.lastCommand + "\n\n"
 			}
-			s += m.output + "\n\n"
+			s += lipgloss.NewStyle().Width(m.contentWidth).Render(m.output) + "\n\n"
 			s += m.hint(keyHint{"esc", "return to menu"})
 		}
 	default:

@@ -4,20 +4,58 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/creack/pty"
+	"github.com/mattn/go-runewidth"
 
 	"github.com/deukyun/helm-tui/internal/config"
 )
 
-type Client struct{}
+type Client struct {
+	mu   sync.Mutex
+	ptmx *os.File // pty master of the in-flight helm command, if any
+
+	// browserOpened receives the login URL each time authPromptWatcher
+	// opens the user's browser for an SSO login (see authwatch.go), so the
+	// TUI can show a live notice while the command is still running.
+	browserOpened chan string
+}
 
 func NewClient() *Client {
-	return &Client{}
+	return &Client{browserOpened: make(chan string, 1)}
+}
+
+// BrowserOpened is fed a URL each time an in-flight helm command's
+// auth-prompt watcher opens the browser for an SSO login.
+func (c *Client) BrowserOpened() <-chan string {
+	return c.browserOpened
+}
+
+func (c *Client) notifyBrowserOpened(url string) {
+	// Non-blocking: execute's pty-reading loop must never stall waiting
+	// for a listener, whether or not the TUI is currently draining this.
+	select {
+	case c.browserOpened <- url:
+	default:
+	}
+}
+
+// Cancel interrupts the in-flight helm command, if any, by writing a
+// Ctrl+C byte to its pty - the same signal sent if the user pressed
+// Ctrl+C in a real terminal running helm directly.
+func (c *Client) Cancel() {
+	c.mu.Lock()
+	ptmx := c.ptmx
+	c.mu.Unlock()
+	if ptmx != nil {
+		_, _ = ptmx.Write([]byte{0x03})
+	}
 }
 
 // ansiRe strips ANSI escape sequences from execute's output - running helm
@@ -44,7 +82,16 @@ func (c *Client) execute(args []string) (string, error) {
 	}
 	defer ptmx.Close()
 
-	watcher := newAuthPromptWatcher(ptmx)
+	c.mu.Lock()
+	c.ptmx = ptmx
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.ptmx = nil
+		c.mu.Unlock()
+	}()
+
+	watcher := newAuthPromptWatcher(ptmx, c.notifyBrowserOpened)
 	if _, copyErr := io.Copy(watcher, ptmx); copyErr != nil && !errors.Is(copyErr, syscall.EIO) {
 		// A pty master read after the child exits commonly surfaces as
 		// EIO on Linux instead of a clean io.EOF; anything else here is
@@ -118,18 +165,31 @@ func CommandString(args []string) string {
 	return strings.Join(parts, " ")
 }
 
+const (
+	mlcsFirstIndent = "  "
+	mlcsContIndent  = "    "
+	mlcsWrapIndent  = "      "
+	mlcsContMarker  = " \\"
+)
+
 // MultilineCommandString renders args as a multi-line "helm ..." command,
 // one flag (with its value) per line and "\" line continuations, so a long
 // value (a chart URL, a values-file URL) doesn't force an unreadably wide
 // single line in a narrow terminal.
-func MultilineCommandString(args []string) string {
-	var lines []string
+//
+// width is the display width (in columns) each rendered line should fit
+// within; a flag/value segment wider than that (e.g. a long values-file
+// URL) is further hard-wrapped, rune-width aware, with its own "\"
+// continuations so the command stays syntactically pasteable. width <= 0
+// disables this extra wrapping.
+func MultilineCommandString(args []string, width int) string {
+	var segments []string
 	cur := []string{"helm"}
 	i := 0
 	for i < len(args) {
 		a := args[i]
 		if strings.HasPrefix(a, "-") {
-			lines = append(lines, strings.Join(cur, " "))
+			segments = append(segments, strings.Join(cur, " "))
 			cur = []string{quoteIfNeeded(a)}
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 				cur = append(cur, quoteIfNeeded(args[i+1]))
@@ -140,16 +200,128 @@ func MultilineCommandString(args []string) string {
 		}
 		i++
 	}
-	lines = append(lines, strings.Join(cur, " "))
+	segments = append(segments, strings.Join(cur, " "))
+
+	var lines []string
+	for idx, seg := range segments {
+		indent := mlcsContIndent
+		if idx == 0 {
+			indent = mlcsFirstIndent
+		}
+		lines = append(lines, wrapCommandSegment(seg, indent, width)...)
+	}
 
 	for idx := 0; idx < len(lines)-1; idx++ {
-		lines[idx] += " \\"
-	}
-	lines[0] = "  " + lines[0]
-	for idx := 1; idx < len(lines); idx++ {
-		lines[idx] = "    " + lines[idx]
+		lines[idx] += mlcsContMarker
 	}
 	return strings.Join(lines, "\n")
+}
+
+// wrapCommandSegment renders indent+seg as a single line, or, if that
+// exceeds width, word-wraps seg (rune-width aware) across multiple lines:
+// the first prefixed with indent, the rest with mlcsWrapIndent. A single
+// word too long to fit even alone on a line (e.g. a long values-file URL)
+// is hard-wrapped by character width; words are otherwise kept whole so
+// e.g. a chart name never gets split mid-word.
+func wrapCommandSegment(seg, indent string, width int) []string {
+	full := indent + seg
+	if width <= 0 || runewidth.StringWidth(full) <= width {
+		return []string{full}
+	}
+
+	markerWidth := runewidth.StringWidth(mlcsContMarker)
+	firstBudget := width - runewidth.StringWidth(indent) - markerWidth
+	if firstBudget < 1 {
+		firstBudget = 1
+	}
+	contBudget := width - runewidth.StringWidth(mlcsWrapIndent) - markerWidth
+	if contBudget < 1 {
+		contBudget = 1
+	}
+
+	var lines []string
+	curIndent, curBudget := indent, firstBudget
+	var cur []string
+	curWidth := 0
+
+	flush := func() {
+		if len(cur) == 0 {
+			return
+		}
+		lines = append(lines, curIndent+strings.Join(cur, " "))
+		cur = nil
+		curWidth = 0
+		curIndent, curBudget = mlcsWrapIndent, contBudget
+	}
+
+	for _, word := range splitWords(seg) {
+		wordWidth := runewidth.StringWidth(word)
+		for wordWidth > curBudget {
+			// The word alone doesn't fit even on an empty line: hard-wrap
+			// it by character width rather than overflowing.
+			flush()
+			var chunk string
+			chunk, word = takeRuneWidth(word, curBudget)
+			lines = append(lines, curIndent+chunk)
+			curIndent, curBudget = mlcsWrapIndent, contBudget
+			wordWidth = runewidth.StringWidth(word)
+		}
+		sep := 0
+		if len(cur) > 0 {
+			sep = 1
+		}
+		if len(cur) > 0 && curWidth+sep+wordWidth > curBudget {
+			flush()
+			sep = 0
+		}
+		curWidth += sep + wordWidth
+		cur = append(cur, word)
+	}
+	flush()
+	return lines
+}
+
+// splitWords splits s on spaces that are not inside a double-quoted
+// substring, so a quoted value with embedded spaces (see quoteIfNeeded)
+// wraps as a single unit instead of having its quoting broken across lines.
+func splitWords(s string) []string {
+	var words []string
+	var cur []rune
+	inQuotes := false
+	for _, r := range s {
+		switch {
+		case r == '"':
+			inQuotes = !inQuotes
+			cur = append(cur, r)
+		case r == ' ' && !inQuotes:
+			if len(cur) > 0 {
+				words = append(words, string(cur))
+				cur = nil
+			}
+		default:
+			cur = append(cur, r)
+		}
+	}
+	if len(cur) > 0 {
+		words = append(words, string(cur))
+	}
+	return words
+}
+
+// takeRuneWidth splits off a prefix of s whose total display width fits
+// within width (always taking at least one rune, so it makes progress even
+// when a single wide rune exceeds width on its own).
+func takeRuneWidth(s string, width int) (taken, rest string) {
+	w := 0
+	runes := []rune(s)
+	for i, r := range runes {
+		rw := runewidth.RuneWidth(r)
+		if w+rw > width && i > 0 {
+			return string(runes[:i]), string(runes[i:])
+		}
+		w += rw
+	}
+	return s, ""
 }
 
 func (c *Client) Upgrade(p config.ReleaseProfile, dryRun bool) (string, error) {

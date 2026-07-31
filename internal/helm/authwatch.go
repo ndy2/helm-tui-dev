@@ -31,10 +31,15 @@ type authPromptWatcher struct {
 	keycloakIndex string
 	answered      bool
 	opened        bool
+
+	// onOpen, if non-nil, is called with the login URL right after it's
+	// opened in the browser, so a caller (the TUI) can surface a live
+	// notice while the helm command is still running.
+	onOpen func(url string)
 }
 
-func newAuthPromptWatcher(stdin io.Writer) *authPromptWatcher {
-	return &authPromptWatcher{stdin: stdin, keycloakIndex: "1"}
+func newAuthPromptWatcher(stdin io.Writer, onOpen func(url string)) *authPromptWatcher {
+	return &authPromptWatcher{stdin: stdin, keycloakIndex: "1", onOpen: onOpen}
 }
 
 var (
@@ -62,6 +67,9 @@ func (w *authPromptWatcher) Write(p []byte) (int, error) {
 		if m := authLoginURLRe.FindStringSubmatch(w.pending); m != nil {
 			w.opened = true
 			_ = openBrowser(m[1])
+			if w.onOpen != nil {
+				w.onOpen(m[1])
+			}
 		}
 	}
 
