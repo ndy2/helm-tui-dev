@@ -1011,6 +1011,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					releases := m.config.Contexts[item.context]
 					for i, r := range releases {
 						if r.ReleaseName == item.profile.ReleaseName {
+							p.LastSelected = time.Now().Unix()
 							m.config.Contexts[item.context][i] = p
 							break
 						}
@@ -1123,6 +1124,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					releases := m.config.Contexts[m.currentContext]
 					for i, r := range releases {
 						if r.ReleaseName == selectedItem.profile.ReleaseName {
+							p.LastSelected = time.Now().Unix()
 							m.config.Contexts[m.currentContext][i] = p
 							break
 						}
