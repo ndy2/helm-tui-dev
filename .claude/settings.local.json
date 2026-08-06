@@ -15,7 +15,9 @@
       "Bash(xargs ls)",
       "Bash(git stash *)",
       "Bash(git add *)",
-      "Bash(git restore *)"
+      "Bash(git restore *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ],
     "additionalDirectories": [
       "/home/deukyun/Desktop/helm-tui"
