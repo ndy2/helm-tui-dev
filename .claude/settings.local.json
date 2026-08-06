@@ -11,7 +11,11 @@
       "Bash(go vet *)",
       "Bash(gofmt -l .)",
       "Bash(git -C /home/deukyun/Desktop/repos/helm-tui status --short)",
-      "Bash(gofmt -d internal/tui/model.go)"
+      "Bash(gofmt -d internal/tui/model.go)",
+      "Bash(xargs ls)",
+      "Bash(git stash *)",
+      "Bash(git add *)",
+      "Bash(git restore *)"
     ],
     "additionalDirectories": [
       "/home/deukyun/Desktop/helm-tui"

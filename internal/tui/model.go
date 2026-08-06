@@ -225,15 +225,26 @@ func (i releaseItem) Description() string { return i.profile.Namespace }
 func (i releaseItem) FilterValue() string { return i.Title() }
 
 // appVersionPattern matches a semantic version optionally followed by a
-// pre-release/build suffix (e.g. "1.0.1.1-AIE-948-7-SNAPSHOT"), as it
-// appears embedded in a RemoteValues URL.
-var appVersionPattern = regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+(?:-[a-zA-Z0-9\.\-]+)?)`)
+// pre-release/build suffix, either dash-separated (e.g.
+// "1.0.1.1-AIE-948-7-SNAPSHOT") or dot-separated as in a PEP 440-style dev
+// build (e.g. "5.0.3.1.dev1234"), as it appears embedded in a RemoteValues
+// URL.
+var appVersionPattern = regexp.MustCompile(`(\d+\.\d+\.\d+\.\d+(?:[-.][a-zA-Z0-9\.\-]+)?)`)
 
 // releaseWordPattern and snapshotWordPattern match the "release"/"snapshot"
 // repository-channel word in an Artifactory-style URL path segment, e.g.
 // ".../lml-generic-release-local/...".
 var releaseWordPattern = regexp.MustCompile(`\brelease\b`)
 var snapshotWordPattern = regexp.MustCompile(`\bsnapshot\b`)
+
+// isSnapshotVersion reports whether ver looks like a non-release build -
+// either an explicit "SNAPSHOT" build or a "dev" build (e.g.
+// "5.0.3.1.dev1234") - which applyAppVersion treats the same as a snapshot
+// for the purposes of picking the Artifactory repo-channel.
+func isSnapshotVersion(ver string) bool {
+	upper := strings.ToUpper(ver)
+	return strings.Contains(upper, "SNAPSHOT") || strings.Contains(upper, "DEV")
+}
 
 func extractAppVersion(url string) string {
 	match := appVersionPattern.FindString(url)
@@ -244,14 +255,14 @@ func extractAppVersion(url string) string {
 }
 
 // applyAppVersion substitutes newVer into url's embedded version. If newVer
-// looks like a snapshot build (contains "SNAPSHOT"), it also repoints the
-// Artifactory repo-channel segment from release to snapshot (e.g.
-// "lml-generic-release-local" -> "lml-generic-snapshot-local"), and vice
-// versa for a plain release version - so quick-editing just the App
+// looks like a snapshot build (see isSnapshotVersion - "SNAPSHOT" or "dev"),
+// it also repoints the Artifactory repo-channel segment from release to
+// snapshot (e.g. "lml-generic-release-local" -> "lml-generic-snapshot-local"),
+// and vice versa for a plain release version - so quick-editing just the App
 // Version is enough to also switch which Artifactory repo it's pulled from.
 func applyAppVersion(url, newVer string) string {
 	result := appVersionPattern.ReplaceAllString(url, newVer)
-	if strings.Contains(strings.ToUpper(newVer), "SNAPSHOT") {
+	if isSnapshotVersion(newVer) {
 		return releaseWordPattern.ReplaceAllString(result, "snapshot")
 	}
 	return snapshotWordPattern.ReplaceAllString(result, "release")
