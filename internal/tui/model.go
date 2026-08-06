@@ -1311,6 +1311,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateEditProfile
 				return m, m.inputs[m.focus].Focus()
 			}
+			if msg.String() == "c" {
+				m.setupCopyProfileForm()
+				m.state = stateAddProfile
+				return m, m.inputs[m.focus].Focus()
+			}
 			if msg.String() == "x" {
 				m.confirmMsg = fmt.Sprintf("Are you sure you want to delete profile %s?", m.selected.ReleaseName)
 				m.confirmCancelState = stateMenu
@@ -1546,6 +1551,20 @@ func (m *Model) setupAddProfileForm() {
 	m.focus = 0
 }
 
+// setupCopyProfileForm opens the add-profile form pre-filled with the
+// selected release's fields, so "c" is a quick way to duplicate a profile
+// (e.g. into a new namespace/context) without retyping every field - the
+// user still edits Release Name (and anything else) before saving, since
+// AddRelease doesn't enforce uniqueness.
+func (m *Model) setupCopyProfileForm() {
+	m.setupAddProfileForm()
+	m.inputs[0].SetValue(m.selected.Namespace)
+	m.inputs[1].SetValue(m.selected.ReleaseName)
+	m.inputs[2].SetValue(m.selected.Chart)
+	m.inputs[3].SetValue(m.selected.Version)
+	m.inputs[4].SetValue(m.selected.RemoteValues)
+}
+
 func (m *Model) setupEditProfileForm() {
 	fields := []string{"Namespace", "Release Name", "Chart", "Version", "Remote Values URL"}
 	m.inputs = make([]textinput.Model, len(fields))
@@ -1737,6 +1756,7 @@ func (m *Model) View() string {
 				keyHint{"r", "Rollback"},
 				keyHint{"d", "Delete"},
 				keyHint{"e/E", "Edit Profile"},
+				keyHint{"c", "Copy Profile"},
 				keyHint{"x", "Delete Profile"},
 			)
 			menuHints := []keyHint{{"↑↓", "switch release"}}
