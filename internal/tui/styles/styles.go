@@ -21,6 +21,7 @@ var (
 	WindowSize        tea.WindowSizeMsg
 	Border            = lipgloss.Border(lipgloss.RoundedBorder())
 	HighlightColor    = lipgloss.AdaptiveColor{Light: "#874BFD", Dark: "#7D56F4"}
+	MarkedColor       = lipgloss.AdaptiveColor{Light: "#2E8B57", Dark: "#4CD787"}
 	InactiveStyle     = lipgloss.NewStyle()
 	ActiveStyle       = InactiveStyle.BorderForeground(HighlightColor)
 )

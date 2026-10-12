@@ -26,6 +26,7 @@ import (
 var docStyle = lipgloss.NewStyle().Margin(1, 2)
 var errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true)
 var selectedStyle = lipgloss.NewStyle().Foreground(styles.HighlightColor).Bold(true)
+var markedStyle = lipgloss.NewStyle().Foreground(styles.MarkedColor)
 var normalStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 var cursorStyle = lipgloss.NewStyle().Background(styles.HighlightColor).Foreground(lipgloss.Color("252"))
 var noticeStyle = lipgloss.NewStyle().Foreground(styles.HighlightColor)
@@ -177,6 +178,15 @@ type Model struct {
 	searchInput textinput.Model
 	searchQuery string
 
+	// Multi-select: rows marked with "space" (toggleRowSelected), keyed by
+	// rowSelectionKey (context + release name) so marks survive list
+	// rebuilds on every search keystroke/config change (see refreshLists).
+	// showSelectedOnly, toggled with "V", additionally filters both tabs'
+	// lists down to just the marked rows - see sortedListItems/
+	// releaseRowListItems, which apply it the same place as matchesSearch.
+	selectedRows     map[string]bool
+	showSelectedOnly bool
+
 	// Inline editing state
 	isEditing    bool
 	editingField int // quickEditChartVer or quickEditAppVersion
@@ -273,10 +283,20 @@ func applyAppVersion(url, newVer string) string {
 // above them. The cursor prefix eats into the first column's width, and
 // each field but the last is truncated to width-1 so a fully-truncated
 // value doesn't run straight into the next column.
-func renderRow(cols []table.Column, selected bool, fields []string) string {
+//
+// selected is the cursor row (list.Model's own index); marked is this row's
+// multi-select state (see toggleRowSelected) - independent of each other,
+// so a marked row keeps its "✓" even once the cursor moves off it, and the
+// cursor row keeps its "●" even over an unmarked row.
+func renderRow(cols []table.Column, selected, marked bool, fields []string) string {
 	cursor := "  "
-	if selected {
+	switch {
+	case selected && marked:
+		cursor = "✓●"
+	case selected:
 		cursor = "● "
+	case marked:
+		cursor = "✓ "
 	}
 
 	var b strings.Builder
@@ -307,8 +327,11 @@ func renderRow(cols []table.Column, selected bool, fields []string) string {
 	}
 
 	rowStyle := normalStyle
-	if selected {
+	switch {
+	case selected:
 		rowStyle = selectedStyle
+	case marked:
+		rowStyle = markedStyle
 	}
 	return rowStyle.Render(b.String())
 }
@@ -345,7 +368,8 @@ func (d releaseDelegate) Render(w io.Writer, m list.Model, index int, item list.
 		}
 	}
 
-	fmt.Fprintf(w, "%s", renderRow(d.model.table.Columns(), selected, fields))
+	marked := d.model.isRowSelected(d.model.currentContext, i.profile.ReleaseName)
+	fmt.Fprintf(w, "%s", renderRow(d.model.table.Columns(), selected, marked, fields))
 }
 
 // releaseRowItem is a row in the Release tab's flat list: one (release,
@@ -400,7 +424,8 @@ func (d releaseRowDelegate) Render(w io.Writer, m list.Model, index int, item li
 		}
 	}
 
-	fmt.Fprintf(w, "%s", renderRow(d.model.releaseTable.Columns(), selected, fields))
+	marked := d.model.isRowSelected(i.context, i.profile.ReleaseName)
+	fmt.Fprintf(w, "%s", renderRow(d.model.releaseTable.Columns(), selected, marked, fields))
 }
 
 // sortedContextNames returns the context names present in cfg, sorted.
@@ -516,7 +541,7 @@ func NewModel(fixedHeight, fixedWidth int) (*Model, error) {
 	// Initialize Table
 	m.table = components.GenerateTable()
 	m.tableCols = []components.ColumnDefinition{
-		{Title: "RELEASE", Width: 20},
+		{Title: "RELEASE", Width: 30},
 		{Title: "NAMESPACE", Width: 15},
 		{Title: "CHART VER", Width: 12},
 		{Title: "APP VERSION", FlexFactor: 1},
@@ -538,7 +563,7 @@ func NewModel(fixedHeight, fixedWidth int) (*Model, error) {
 
 	// Release tab: flat (release, context) list
 	m.releaseTableCols = []components.ColumnDefinition{
-		{Title: "RELEASE", Width: 22},
+		{Title: "RELEASE", Width: 33},
 		{Title: "CONTEXT", Width: 17},
 		{Title: "NAMESPACE", Width: 13},
 		{Title: "CHART VER", Width: 12},
@@ -570,16 +595,61 @@ func matchesSearch(query string, p config.ReleaseProfile) bool {
 	return strings.Contains(strings.ToLower(p.ReleaseName), q) || strings.Contains(strings.ToLower(p.Namespace), q)
 }
 
+// rowSelectionKey identifies a release row for multi-select purposes.
+// Release name is unique within a context (lookups elsewhere in this file
+// match profiles the same way), so context+name is a stable identity that
+// survives the list rebuilds sortedListItems/releaseRowListItems do on
+// every search keystroke.
+func rowSelectionKey(context, releaseName string) string {
+	return context + "\x00" + releaseName
+}
+
+// isRowSelected reports whether the given release row is marked (see
+// toggleRowSelected).
+func (m *Model) isRowSelected(context, releaseName string) bool {
+	return m.selectedRows[rowSelectionKey(context, releaseName)]
+}
+
+// hasSelectedRows reports whether any row is currently marked.
+func (m *Model) hasSelectedRows() bool {
+	return len(m.selectedRows) > 0
+}
+
+// toggleRowSelected marks/unmarks a release row (the "space" key on either
+// tab). Unmarking the last remaining row turns showSelectedOnly back off,
+// so the filter never gets stuck showing an empty list with no selection
+// left to explain it.
+func (m *Model) toggleRowSelected(context, releaseName string) {
+	if m.selectedRows == nil {
+		m.selectedRows = make(map[string]bool)
+	}
+	key := rowSelectionKey(context, releaseName)
+	if m.selectedRows[key] {
+		delete(m.selectedRows, key)
+		if len(m.selectedRows) == 0 {
+			m.showSelectedOnly = false
+		}
+	} else {
+		m.selectedRows[key] = true
+	}
+	m.refreshLists()
+}
+
 // sortedListItems returns the release items for ctx matching the active
-// search query (see matchesSearch), sorted by LastSelected (desc) then
-// ReleaseName (asc).
+// search query (see matchesSearch) and, if showSelectedOnly is on, the
+// marked-rows filter (see toggleRowSelected) - sorted by LastSelected
+// (desc) then ReleaseName (asc).
 func (m *Model) sortedListItems(ctx string) []list.Item {
 	releases := m.config.GetReleasesForContext(ctx)
 	filtered := make([]config.ReleaseProfile, 0, len(releases))
 	for _, r := range releases {
-		if matchesSearch(m.searchQuery, r) {
-			filtered = append(filtered, r)
+		if !matchesSearch(m.searchQuery, r) {
+			continue
 		}
+		if m.showSelectedOnly && !m.isRowSelected(ctx, r.ReleaseName) {
+			continue
+		}
+		filtered = append(filtered, r)
 	}
 	sort.Slice(filtered, func(i, j int) bool {
 		if filtered[i].LastSelected != filtered[j].LastSelected {
@@ -639,6 +709,9 @@ func (m *Model) releaseRowListItems() []list.Item {
 	for ctx, profiles := range m.config.Contexts {
 		for _, p := range profiles {
 			if !matchesSearch(m.searchQuery, p) {
+				continue
+			}
+			if m.showSelectedOnly && !m.isRowSelected(ctx, p.ReleaseName) {
 				continue
 			}
 			rows = append(rows, row{ctx: ctx, profile: p})
@@ -966,6 +1039,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, textinput.Blink
 		}
 
+		// "V" toggles showing only marked rows (see toggleRowSelected).
+		// Turning it on requires at least one marked row, so it can't leave
+		// the list stuck empty with no indication why; turning it back off
+		// is always allowed.
+		if msg.String() == "V" && !m.isTyping() && (m.state == stateList || m.state == stateReleaseList) {
+			if m.showSelectedOnly || m.hasSelectedRows() {
+				m.showSelectedOnly = !m.showSelectedOnly
+				m.refreshLists()
+			}
+			return m, nil
+		}
+
 		if m.searching {
 			if msg.String() == "up" || msg.String() == "down" {
 				// Let the arrow keys move the selection in the filtered
@@ -1110,6 +1195,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateAddProfile
 				return m, m.inputs[m.focus].Focus()
 			}
+			if msg.String() == " " {
+				if item, ok := m.releaseList.SelectedItem().(releaseRowItem); ok {
+					m.toggleRowSelected(item.context, item.profile.ReleaseName)
+				}
+				return m, listCmd
+			}
 			return m, listCmd
 		}
 
@@ -1234,6 +1325,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected = selectedItem.profile
 				m.confirmUpgrade(m.selected, stateList)
 				return m, nil
+			}
+			if msg.String() == " " {
+				if selectedItem, ok := m.list.SelectedItem().(releaseItem); ok {
+					m.toggleRowSelected(m.currentContext, selectedItem.profile.ReleaseName)
+				}
+				return m, listCmd
 			}
 			return m, listCmd
 		} else if m.state == stateMenu {
@@ -1640,6 +1737,9 @@ func (m *Model) renderTabBar() string {
 	}
 	left := lipgloss.JoinHorizontal(lipgloss.Top, rendered...)
 	right := m.renderSearchBox()
+	if sel := m.renderSelectionBox(); sel != "" {
+		right = sel + "   " + right
+	}
 
 	gap := m.contentWidth - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 1 {
@@ -1662,6 +1762,21 @@ func (m *Model) renderSearchBox() string {
 	}
 }
 
+// renderSelectionBox renders the marked-row count and the "V" show-only
+// toggle hint, shown at the tab bar's right end just left of the search
+// box. Empty once nothing is marked, so it doesn't clutter the idle view.
+func (m *Model) renderSelectionBox() string {
+	n := len(m.selectedRows)
+	if n == 0 {
+		return ""
+	}
+	status := markedStyle.Render(fmt.Sprintf("✓ %d marked", n))
+	if m.showSelectedOnly {
+		return status + "  " + hintStyle.Render("(") + keyStyle.Render("V") + hintStyle.Render(" show all)")
+	}
+	return status + "  " + hintStyle.Render("(") + keyStyle.Render("V") + hintStyle.Render(" show only)")
+}
+
 func (m *Model) View() string {
 	doc := m.renderTabBar() + "\n\n"
 
@@ -1682,6 +1797,7 @@ func (m *Model) View() string {
 		} else {
 			doc += "  " + m.hint(
 				keyHint{"enter", "select"},
+				keyHint{"space", "mark"},
 				keyHint{"a", "add profile"},
 				keyHint{"e", "edit"},
 				keyHint{"u", "upgrade"},
@@ -1711,6 +1827,7 @@ func (m *Model) View() string {
 		} else {
 			s += "  " + m.hint(
 				keyHint{"enter", "select"},
+				keyHint{"space", "mark"},
 				keyHint{"a", "add profile"},
 				keyHint{"e", "edit"},
 				keyHint{"u", "upgrade"},
